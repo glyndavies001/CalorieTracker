@@ -15,7 +15,7 @@ Fitbit, plus calories, protein, carbs, fat and body weight.
 
 Handy details:
 
-- **Barcode scanning** – scan when adding to the diary or on the Foods tab. The household's foods are checked
+- **Barcode scanning** – scan when adding to the diary or in the Library (Foods). The household's foods are checked
   first, then [Open Food Facts](https://world.openfoodfacts.org) (a free, open product database); a found product
   opens pre-filled to check and save. The barcode is kept on the food, so the next scan finds it straight away.
   Phones with a built-in barcode reader (Android) use it; others (iPhone) use ZXing, downloaded on first use.

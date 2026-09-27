@@ -6,7 +6,7 @@
 (function () {
   "use strict";
 
-  const APP_VERSION = "2.0.0";
+  const APP_VERSION = "2.0.1";
   const SUPABASE_URL = "https://yfbarahnwcrwewtpithb.supabase.co";
   const SUPABASE_KEY = "sb_publishable_ItUAbr04KIijWuO-JWgDNg_J5YCwaqK";
   const DIARY_DAYS = 120;   // diary history loaded up front; older days load when opened
@@ -179,7 +179,7 @@
     burn: new Map(), steps: new Map(), push: { checked: false },   // from the Fitbit: day -> kcal burned, day -> steps
     health: { page: null, live: null, sleep: null, heart: null, shown: null, cheer: null, nightSel: null, hrSel: null, restSel: null },
     sort: pref.get("sort", "az") === "used" ? "used" : "az",
-    mode: "day", month: isoDay().slice(0, 7), mSel: null, mLoading: false };   // Today tab: one day, or a month at a time
+    mode: "day", month: isoDay().slice(0, 7), mSel: null, mLoading: false };   // Food tab: one day, or a month at a time
   const foodsById = () => Object.fromEntries(S.foods.map(f => [f.id, f]));
   const STEP_GOAL = 10000;
   const stepGoal = () => (+S.settings.step_goal > 0 ? +S.settings.step_goal : STEP_GOAL);
@@ -250,17 +250,18 @@
   // Calories burned and steps come from the Fitbit (Google Health) through the "fitbit" server
   // function: the last two weeks each time (a late watch sync can change earlier days), when the
   // app opens or comes back, and every couple of minutes while it's open.
-  const SYNC_EVERY = 2 * 60 * 1000;
-  let lastBurnSync = 0, burnSyncing = false;
+  const SYNC_EVERY = 2 * 60 * 1000, FULL_EVERY = 30 * 60 * 1000;   // the whole two weeks: on opening, then every half hour
+  let lastBurnSync = 0, lastFullSync = 0, burnSyncing = false;
   async function syncBurn(force) {
     if (!S.user || S.settings.fit_status !== "linked" || burnSyncing) return;
     if (!force && Date.now() - lastBurnSync < SYNC_EVERY) return;
     burnSyncing = true;
     try {
-      const today = isoDay();
-      const { data, error } = await sb.functions.invoke("fitbit", { body: { action: "sync", today, from: addDays(today, -13) } });
+      const today = isoDay(), full = Date.now() - lastFullSync > FULL_EVERY;
+      const { data, error } = await sb.functions.invoke("fitbit", { body: { action: "sync", today, from: addDays(today, full ? -13 : -1) } });
       if (error) throw error;
       lastBurnSync = Date.now();
+      if (full) lastFullSync = lastBurnSync;
       const before = fitSig();
       if (data && data.reconnect) S.settings.fit_status = "reauth";
       else if (data && data.linked === false) S.settings.fit_status = null;
@@ -305,15 +306,22 @@
   }
 
   // ── Rendering ─────────────────────────────────────────────────────────────
+  let homeShown = "";   // Home as last drawn
   function render() {
     if (!S.user) return renderLogin();
     let body = `<div class="empty">Loading…</div>`;
-    if (!S.loading) body = S.view === "foods" ? viewFoods() : S.view === "dishes" ? viewDishes() : S.view === "weight" ? viewWeight() : S.view === "today" ? viewToday() : viewHome();
+    if (!S.loading) body = S.view === "foods" ? viewFoods() : S.view === "dishes" ? viewDishes() : S.view === "weight" ? viewWeight() : S.view === "today" ? viewToday() : (homeShown = viewHome());
     const tab = (k, ic, l, on) => `<button data-act="tab" data-v="${k}" class="${on ? "on" : ""}"><span class="ic">${ic}</span>${l}</button>`;
     $app.innerHTML = `<header class="top"><h1 class="brand">${MARK}<span>VITALS</span></h1>
         <button class="iconbtn" data-act="settings" aria-label="Settings">⚙️</button></header>
       <main>${body}</main>
       <nav class="tabs">${tab("home", "🏠", "Home", S.view === "home")}${tab("today", "🍽️", "Food", S.view === "today")}${tab("library", "🥕", "Library", S.view === "foods" || S.view === "dishes")}${tab("weight", "⚖️", "Weight", S.view === "weight")}</nav>`;
+  }
+  // Refreshes redraw Home only when something on it changed: a redraw mid-tap can lose the tap.
+  function renderHome() {
+    if (!S.user || S.loading || S.view !== "home" || ctx || S.health.page) return;
+    if (viewHome() !== homeShown) render();
+    tickLive();
   }
   // The Vitals mark: a pulse line, violet to pink.
   const MARK = `<svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><defs><linearGradient id="vg" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#8b7cff"/><stop offset="1" stop-color="#ff6fa8"/></linearGradient></defs><path d="M2 13h4.5l2.2-6 4.3 11 2.8-7.5 1.7 2.5H22" fill="none" stroke="url(#vg)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
@@ -358,7 +366,8 @@
     const s = S.steps.get(day);
     if (s == null) return "";
     const goal = stepGoal(), done = s >= goal;
-    return `<div class="steps tap" data-act="hopen" data-p="steps" role="button" tabindex="0" aria-label="Steps: open the Steps page"><div class="row small"><span class="grow muted">Steps <b style="color:var(--soft)">${fmtK(s)}</b> <span class="faint">/ ${fmtK(goal)}</span></span>
+    const open = day === isoDay() ? ` tap" data-act="hopen" data-p="steps" role="button" tabindex="0" aria-label="Steps: open the Steps page` : "";
+    return `<div class="steps${open}"><div class="row small"><span class="grow muted">Steps <b style="color:var(--soft)">${fmtK(s)}</b> <span class="faint">/ ${fmtK(goal)}</span></span>
         ${done ? `<span class="down">✓ Goal reached</span>` : `<span class="muted">${fmtK(goal - s)} ${day === isoDay() ? "to go" : "short"}</span>`}</div>
       <div class="bar thin"><div style="width:${Math.min(100, (s / goal) * 100)}%;background:${done ? "var(--green)" : "var(--blue)"}"></div></div>
       ${day === isoDay() && S.settings.fit_synced_at ? `<div class="tiny faint" id="fitAt" style="text-align:right;margin-top:4px">${syncedText()}</div>` : ""}</div>`;
@@ -606,7 +615,7 @@
     if (!hr || !hr.day) return ["…", "Loading…"];
     const r = (hr.resting || []).slice(-1)[0], last = hr.day[hr.day.length - 1];
     return [r ? `${r.bpm} <span class="small dim">bpm</span>` : last ? `${last.avg} <span class="small dim">bpm</span>` : "—",
-      r ? `Resting${last ? ` · now ${last.avg}` : ""}` : last ? `Latest, at ${clock(last.t)}` : "No heart rate yet today"];
+      r ? `Resting${last ? ` · latest ${last.avg}` : ""}` : last ? `Latest, at ${clock(last.t)}` : "No heart rate yet today"];
   }
   function viewHome() {
     const today = isoDay(), name = (S.settings.display_name || "").trim(), h = new Date().getHours();
@@ -762,8 +771,8 @@
     } catch (e) { wake = null; }
   }
 
-  // Refreshing: every 20 seconds while the Health tab or a page is open, and the live
-  // count ticks four times a second on the Steps page.
+  // Refreshing: every 20 seconds while Home or a page is open, and the live
+  // count ticks four times a second on Home and the Steps page.
   let hTimer = null, tTimer = null;
   function healthTimers() {
     clearInterval(hTimer); clearInterval(tTimer); hTimer = tTimer = null;
@@ -777,13 +786,15 @@
     else if (p === "sleep") await loadSleep(false);
     else await loadLive();
     if (S.health.page) { if (S.health.page === "steps" && document.getElementById("liveNum")) tickLive(); else renderPage(); }
-    else if (S.view === "home" && !ctx) { render(); tickLive(); }
+    else renderHome();
   }
   async function enterHealth() {
     healthTimers();
     if (S.settings.fit_status !== "linked") return;
-    await Promise.all([loadLive(), loadSleep(false), loadHeart(false)]);
-    if (S.view === "home" && !ctx && !S.health.page) { render(); tickLive(); }
+    // back on Home: nothing fetched again that's only just been fetched
+    const lv = S.health.live, h = S.health.heart, recent = (x, ms) => x && Date.now() - (x.at || 0) < ms;
+    await Promise.all([recent(lv, 20000) ? null : loadLive(), loadSleep(false), recent(h && h.day && h, 60000) ? null : loadHeart(false)]);
+    renderHome();
   }
   async function hcall(action, extra) {
     const { data, error } = await sb.functions.invoke("fitbit", { body: { action, ...(extra || {}) } });
@@ -850,6 +861,7 @@
     const pace = paceOf(lv.minutes, lv.syncedAt), prev = S.health.shown;
     const shown = S.health.shown = liveShown(prev, liveEstimate(lv.steps, pace, lv.syncedAt, now), pace);
     if (onHome) {
+      if (el("homeSteps").textContent === fmtK(shown)) return;
       el("homeSteps").textContent = fmtK(shown);
       el("homeStepsBar").style.width = Math.min(100, (shown / goal) * 100) + "%";
       el("homeStepsBar").style.background = shown >= goal ? "var(--green)" : "var(--blue)";
@@ -1398,7 +1410,7 @@
   function ingPickHtml() {
     const q = ctx.q.trim().toLowerCase();
     const list = byName(S.foods).filter(f => !q || f.name.toLowerCase().includes(q)).slice(0, 60);
-    if (!S.foods.length) return `<div class="empty">Add foods first (Foods tab).</div>`;
+    if (!S.foods.length) return `<div class="empty">Add foods first (Library tab).</div>`;
     if (!list.length) return `<div class="empty">No foods match.</div>`;
     return `<div class="list" style="margin-top:6px">${list.map(f => `<div class="item tap" data-act="ingPick" data-id="${f.id}">
       <div class="grow"><div class="name ellip">${esc(f.name)}</div></div><div class="small muted">${fmtK(f.kcal)} / ${basisText(f.unit)}</div></div>`).join("")}</div>`;
@@ -1528,7 +1540,7 @@
   }
 
   // ── Barcode scanner ───────────────────────────────────────────────────────
-  // Opened from the Add sheet ("pick": log it), the Foods tab ("foods": add or
+  // Opened from the Add sheet ("pick": log it), the Library ("foods": add or
   // edit it) or the food form ("link": attach the barcode to that food).
   let scan = null;   // the running camera session
   function openScan(from) {
@@ -1709,7 +1721,7 @@
     tab: el => {
       S.view = el.dataset.v === "library" ? S.lib : el.dataset.v;
       closeSheet(); render(); window.scrollTo(0, 0);
-      healthTimers(); if (S.view === "home") enterHealth();
+      if (S.view === "home") enterHealth(); else healthTimers();
     },
     libTab: el => { S.view = S.lib = el.dataset.k === "dishes" ? "dishes" : "foods"; pref.set("lib", S.lib); render(); },
     hopen: el => openPage(el.dataset.p),
@@ -2086,7 +2098,7 @@
   // ── Start ─────────────────────────────────────────────────────────────────
   // Google sends you back to the app with ?fitbit=connected (or why it didn't work).
   const FIT_MSG = {
-    connected: ["Fitbit connected. Steps, sleep and heart rate are in the Health tab.", false],
+    connected: ["Fitbit connected. Steps, sleep and heart rate are on Home.", false],
     cancelled: ["Fitbit not connected.", false],
     expired: ["That took too long — tap Connect again.", true],
     noscope: ["Tick the activity box on Google's screen, so the app can see calories burned and steps.", true],
@@ -2109,6 +2121,7 @@
     if (S.health.page) closePage(true);
     S.health = { page: null, live: null, sleep: null, heart: null, shown: null, cheer: null, nightSel: null, hrSel: null, restSel: null };
     S.view = "home";
+    lastBurnSync = lastFullSync = 0;
     closeSheet();
     if (!u) { S.loading = false; render(); return; }
     S.loading = true; render();
@@ -2128,7 +2141,7 @@
       const [foods, dishes] = await Promise.all([run(() => sb.from("ct_foods").select("*")), run(() => sb.from("ct_dishes").select("*"))]);
       S.foods = foods || S.foods;
       S.dishes = dishes || S.dishes;
-      if (!ctx) render();
+      if (!ctx && S.view !== "home") render();
     } catch (e) { /* offline: keep what we have */ }
   }
 
