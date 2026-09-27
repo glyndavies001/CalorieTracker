@@ -1,5 +1,5 @@
 // @ts-nocheck
-// CalorieTracker ⇄ Google Health API (Fitbit): calories burned and steps each day, live steps,
+// Vitals ⇄ Google Health API (Fitbit): calories burned and steps each day, live steps,
 // sleep and heart rate, plus the evening step reminder.
 //
 // POST {action:"start"}                → the Google sign-in URL for the caller
@@ -375,7 +375,7 @@ async function pushToUser(userId, msg, cfg) {
   return sent;
 }
 const hourText = h => (h === 0 ? "midnight" : h === 12 ? "noon" : h < 12 ? `${h}am` : `${h - 12}pm`);
-const RELINK = { title: "Couldn't check your steps", body: "Your Fitbit link has run out — open CalorieTracker to reconnect it.", tag: "steps" };
+const RELINK = { title: "Couldn't check your steps", body: "Your Fitbit link has run out — open Vitals to reconnect it.", tag: "steps" };
 
 // Hourly: whoever's reminder hour it is gets checked once today and nudged if under their goal.
 export async function remind(cfg, now = new Date()) {

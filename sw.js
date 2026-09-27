@@ -1,8 +1,8 @@
-// CalorieTracker service worker — network first.
+// Vitals service worker — network first.
 // Online, the app always loads the latest files; the cache is only a fallback
 // when offline. Supabase (cross-origin) calls are never touched.
 
-const CACHE = "ct-v1";
+const CACHE = "vitals-v1";
 const SHELL = ["/", "/index.html", "/app.js", "/vendor/supabase.js", "/manifest.json", "/icon-192.png", "/icon-512.png"];
 
 self.addEventListener("install", (event) => {
@@ -22,7 +22,7 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("push", (event) => {
   let d = {};
   try { d = event.data ? event.data.json() : {}; } catch (e) { d = { body: event.data ? event.data.text() : "" }; }
-  event.waitUntil(self.registration.showNotification(d.title || "CalorieTracker", {
+  event.waitUntil(self.registration.showNotification(d.title || "Vitals", {
     body: d.body || "",
     icon: "/icon-192.png",
     badge: "/badge-96.png",

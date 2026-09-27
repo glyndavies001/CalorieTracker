@@ -1,12 +1,16 @@
-# CalorieTracker
+# Vitals
 
-A small installable web app for tracking calories, protein, carbs, fat and body weight.
+(Formerly CalorieTracker.) A small installable health app for a household: steps, sleep and heart rate from a
+Fitbit, plus calories, protein, carbs, fat and body weight.
 
-- **Today** – a diary by meal, with totals against daily targets; switch to **Month** for a chart of each
+- **Home** – today at a glance: live steps, calories in / out / deficit, last night's sleep, resting and latest
+  heart rate, and weight; each tile opens its page. Reaching the step goal on the Steps page brings a cheer (one of
+  ~40 messages, by name) and confetti.
+- **Food** – a diary by meal, with totals against daily targets; switch to **Month** for a chart of each
   day's calories against the target (over-target days in red), the month's averages, days under/over and
   the weight change, with a tap on any day to open it
-- **Foods** – values typed straight from the label (per 100 g, per serving or per item), or filled in by scanning the barcode
-- **Dishes** – recipes built from the foods list; totals per portion or per cooked weight, updated whenever a food changes
+- **Library** – Foods and Dishes. Foods: values typed straight from the label (per 100 g, per serving or per item), or filled in by scanning the barcode
+  Dishes: recipes built from the foods list; totals per portion or per cooked weight, updated whenever a food changes
 - **Weight** – daily weigh-ins in kg or stones and pounds, with a trend chart and goal
 
 Handy details:
@@ -25,14 +29,15 @@ Handy details:
   Function (`supabase/functions/fitbit`) handles the Google sign-in and fetches the numbers into `ct_burn`;
   refresh tokens live in `ct_fit_links`, and the Google OAuth client id/secret in `ct_config` — both
   readable only by the server.
-- **Health tab** – Steps, Sleep and Heart rate cards, each opening a full-screen page:
+- **Steps, Sleep and Heart pages** – full-screen pages opened from the Home tiles:
   - *Steps*: a big number that keeps climbing at your pace between watch syncs (from the last few minutes of
     minute-by-minute steps), corrected at each sync; pace, when you'll reach the goal, when the watch last synced.
     Keeps the screen on while open.
   - *Sleep*: a night's stages (awake, REM, light, deep) on a timeline, the last 14 nights with the average; tap a
     night to see it.
   - *Heart rate*: resting heart rate over 30 days, and today in 5-minute steps (average line, range band).
-  Pages refresh every 20 seconds while open. Sleep and heart rate need two extra Google permissions (granted
+  Home and the pages refresh every 20 seconds while open. The cheer uses "Your name" from Settings
+  (`ct_settings.display_name`). Sleep and heart rate need two extra Google permissions (granted
   when connecting; `ct_settings.fit_scopes` records which), and are fetched when shown, not stored.
   "Watch synced" times come from the latest minute of activity data Google has (`ct_settings.fit_synced_at`).
 - **Step reminder** – each phone can opt in (Settings → Step reminder, with a time from 5pm to 10pm). A

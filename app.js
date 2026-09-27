@@ -1,4 +1,4 @@
-/* CalorieTracker — foods, dishes built from those foods, a daily diary with
+/* Vitals (formerly CalorieTracker) — foods, dishes built from those foods, a daily diary with
    calories and macros, and body weight. Plain JavaScript with no build step.
    Data lives in Supabase (the ct_* tables). Foods and dishes are one list shared
    by the household; diary, weights and settings are private to each login.
@@ -6,7 +6,7 @@
 (function () {
   "use strict";
 
-  const APP_VERSION = "1.6.0";
+  const APP_VERSION = "2.0.0";
   const SUPABASE_URL = "https://yfbarahnwcrwewtpithb.supabase.co";
   const SUPABASE_KEY = "sb_publishable_ItUAbr04KIijWuO-JWgDNg_J5YCwaqK";
   const DIARY_DAYS = 120;   // diary history loaded up front; older days load when opened
@@ -175,9 +175,9 @@
   };
 
   // ── State ─────────────────────────────────────────────────────────────────
-  const S = { user: null, loading: true, view: "today", day: isoDay(), foods: [], dishes: [], diary: [], diaryFrom: null, weights: [], settings: {}, foodQuery: "",
+  const S = { user: null, loading: true, view: "home", lib: pref.get("lib", "foods") === "dishes" ? "dishes" : "foods", day: isoDay(), foods: [], dishes: [], diary: [], diaryFrom: null, weights: [], settings: {}, foodQuery: "",
     burn: new Map(), steps: new Map(), push: { checked: false },   // from the Fitbit: day -> kcal burned, day -> steps
-    health: { page: null, live: null, sleep: null, heart: null, shown: null, nightSel: null, hrSel: null, restSel: null },
+    health: { page: null, live: null, sleep: null, heart: null, shown: null, cheer: null, nightSel: null, hrSel: null, restSel: null },
     sort: pref.get("sort", "az") === "used" ? "used" : "az",
     mode: "day", month: isoDay().slice(0, 7), mSel: null, mLoading: false };   // Today tab: one day, or a month at a time
   const foodsById = () => Object.fromEntries(S.foods.map(f => [f.id, f]));
@@ -266,7 +266,7 @@
       else if (data && data.linked === false) S.settings.fit_status = null;
       takeBurn(data && data.days);
       if (data && data.syncedAt) S.settings.fit_synced_at = data.syncedAt;
-      if (ctx || !S.user || S.health.page || (S.view !== "today" && S.view !== "health")) return;   // redrawn when you get there
+      if (ctx || !S.user || S.health.page || (S.view !== "today" && S.view !== "home")) return;   // redrawn when you get there
       if (fitSig() !== before) render();
       else { const at = document.getElementById("fitAt"); if (at) at.textContent = syncedText(); }   // just the time
     } catch (e) { console.error(e); /* offline or Google hiccup: keep what we have */ }
@@ -308,18 +308,20 @@
   function render() {
     if (!S.user) return renderLogin();
     let body = `<div class="empty">Loading…</div>`;
-    if (!S.loading) body = S.view === "foods" ? viewFoods() : S.view === "dishes" ? viewDishes() : S.view === "weight" ? viewWeight() : S.view === "health" ? viewHealth() : viewToday();
-    const tab = (k, ic, l) => `<button data-act="tab" data-v="${k}" class="${S.view === k ? "on" : ""}"><span class="ic">${ic}</span>${l}</button>`;
-    $app.innerHTML = `<header class="top"><h1 class="brand">CALORIE<span>TRACKER</span></h1>
+    if (!S.loading) body = S.view === "foods" ? viewFoods() : S.view === "dishes" ? viewDishes() : S.view === "weight" ? viewWeight() : S.view === "today" ? viewToday() : viewHome();
+    const tab = (k, ic, l, on) => `<button data-act="tab" data-v="${k}" class="${on ? "on" : ""}"><span class="ic">${ic}</span>${l}</button>`;
+    $app.innerHTML = `<header class="top"><h1 class="brand">${MARK}<span>VITALS</span></h1>
         <button class="iconbtn" data-act="settings" aria-label="Settings">⚙️</button></header>
       <main>${body}</main>
-      <nav class="tabs">${tab("today", "🍽️", "Today")}${tab("foods", "🥕", "Foods")}${tab("dishes", "🍲", "Dishes")}${tab("weight", "⚖️", "Weight")}${tab("health", "💓", "Health")}</nav>`;
+      <nav class="tabs">${tab("home", "🏠", "Home", S.view === "home")}${tab("today", "🍽️", "Food", S.view === "today")}${tab("library", "🥕", "Library", S.view === "foods" || S.view === "dishes")}${tab("weight", "⚖️", "Weight", S.view === "weight")}</nav>`;
   }
+  // The Vitals mark: a pulse line, violet to pink.
+  const MARK = `<svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><defs><linearGradient id="vg" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#8b7cff"/><stop offset="1" stop-color="#ff6fa8"/></linearGradient></defs><path d="M2 13h4.5l2.2-6 4.3 11 2.8-7.5 1.7 2.5H22" fill="none" stroke="url(#vg)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
   function renderLogin() {
     $app.innerHTML = `<div class="login"><div class="box">
-      <div style="text-align:center;font-size:44px;margin-bottom:10px">🍽️</div>
-      <h1>CALORIE<span>TRACKER</span></h1>
+      <div class="login-mark">${MARK}</div>
+      <h1>VITALS</h1>
       <p class="dim" style="text-align:center;font-size:13px;margin:6px 0 26px">Sign in with your Vaulted account</p>
       <input class="inp" id="email" type="email" autocomplete="username" placeholder="Email">
       <input class="inp" id="pw" type="password" autocomplete="current-password" placeholder="Password">
@@ -587,40 +589,127 @@
       <button class="btn ghost block" data-act="hretry">Try again</button></div>`;
   const loadingCard = `<div class="empty">Loading…</div>`;
 
-  // Health tab: a card each for steps, sleep and heart rate; tap one for its page.
-  function viewHealth() {
-    if (!S.settings.fit_status) return `<div class="card"><div class="label">Health</div>
-      <p class="small muted" style="margin:8px 0 12px">Connect your Fitbit to see your steps, sleep and heart rate here.</p>
-      <button class="btn blue block" data-act="fitConnect">Connect Fitbit</button></div>`;
-    let html = S.settings.fit_status === "reauth" ? reauthCard() : "";
-    const today = isoDay(), goal = stepGoal(), st = S.steps.get(today);
-    const card = (p, icon, label, value, sub, extra = "") => `<div class="card hcard" data-act="hopen" data-p="${p}" role="button" tabindex="0" aria-label="${label}">
-      <div class="row"><span class="hic" aria-hidden="true">${icon}</span><div class="grow"><div class="label">${label}</div><div class="hval">${value}</div>
-      <div class="small muted">${sub}</div></div><span class="chev" aria-hidden="true">›</span></div>${extra}</div>`;
-    html += card("steps", "👟", "Steps today", st != null ? fmtK(st) : "—",
-      st == null ? "Waiting for the watch" : st >= goal ? `✓ ${fmtK(goal)} reached` : `${fmtK(goal - st)} to go${syncedText() ? " · " + syncedText() : ""}`,
-      st != null ? `<div class="bar thin" style="margin-top:10px"><div style="width:${Math.min(100, (st / goal) * 100)}%;background:${st >= goal ? "var(--green)" : "var(--blue)"}"></div></div>` : "");
-    const sl = S.health.sleep;
-    let sv = "…", ss = "Loading…";
-    if (!hasScope("sleep") || (sl && sl.needScope)) { sv = "—"; ss = "Tap to allow sleep"; }
-    else if (sl && sl.err) { sv = "—"; ss = "Couldn't load it. Tap to try again"; }
-    else if (sl && sl.sessions) {
-      const n = nightsOf(sl.sessions).pop();
-      if (n) { sv = fmtDur(n.asleep); ss = `${n.day === today ? "Last night" : shortDate(n.day)} · ${clock(n.start)} – ${clock(n.end)}`; } else { sv = "—"; ss = "No sleep recorded yet"; }
-    }
-    html += card("sleep", "😴", "Sleep", sv, ss);
+  // ── Home: today at a glance; each tile opens its page ──
+  // (the tile values that need the Fitbit data: last night's sleep, heart rate)
+  function sleepSummary() {
+    const sl = S.health.sleep, today = isoDay();
+    if (!hasScope("sleep") || (sl && sl.needScope)) return ["—", "Tap to allow sleep"];
+    if (sl && sl.err) return ["—", "Couldn't load it. Tap to try again"];
+    if (!sl || !sl.sessions) return ["…", "Loading…"];
+    const n = nightsOf(sl.sessions).pop();
+    return n ? [fmtDur(n.asleep), `${n.day === today ? "" : shortDate(n.day) + " · "}${clock(n.start)} – ${clock(n.end)}`] : ["—", "No sleep recorded yet"];
+  }
+  function heartSummary() {
     const hr = S.health.heart;
-    let hv = "…", hs = "Loading…";
-    if (!hasScope("heart") || (hr && hr.needScope)) { hv = "—"; hs = "Tap to allow heart rate"; }
-    else if (hr && hr.err) { hv = "—"; hs = "Couldn't load it. Tap to try again"; }
-    else if (hr && hr.day) {
-      const r = (hr.resting || []).slice(-1)[0], last = hr.day[hr.day.length - 1];
-      hv = r ? `${r.bpm} <span class="small dim">bpm resting</span>` : "—";
-      hs = last ? `Latest ${last.avg} bpm at ${clock(last.t)}` : "No heart rate yet today";
+    if (!hasScope("heart") || (hr && hr.needScope)) return ["—", "Tap to allow heart rate"];
+    if (hr && hr.err) return ["—", "Couldn't load it. Tap to try again"];
+    if (!hr || !hr.day) return ["…", "Loading…"];
+    const r = (hr.resting || []).slice(-1)[0], last = hr.day[hr.day.length - 1];
+    return [r ? `${r.bpm} <span class="small dim">bpm</span>` : last ? `${last.avg} <span class="small dim">bpm</span>` : "—",
+      r ? `Resting${last ? ` · now ${last.avg}` : ""}` : last ? `Latest, at ${clock(last.t)}` : "No heart rate yet today"];
+  }
+  function viewHome() {
+    const today = isoDay(), name = (S.settings.display_name || "").trim(), h = new Date().getHours();
+    const hello = h < 5 ? "Hello" : h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening";
+    let html = `<div class="hello"><div class="hi">${hello}${name ? ", " + esc(name) : ""}</div><div class="small dim">${esc(longDate(today))}</div></div>`;
+    const fit = S.settings.fit_status;
+    if (fit === "reauth") html += reauthCard();
+    const tile = (attrs, icon, label, body) => `<div class="card tile" ${attrs} role="button" tabindex="0">
+      <div class="row tile-h"><span class="tic" aria-hidden="true">${icon}</span><span class="label grow">${label}</span><span class="chev" aria-hidden="true">›</span></div>${body}</div>`;
+    // steps, counting on live between syncs
+    const goal = stepGoal(), st = S.steps.get(today);
+    if (fit) {
+      html += tile(`data-act="hopen" data-p="steps" aria-label="Steps"`, "👟", "Steps",
+        st == null ? `<div class="tval">–</div><div class="small muted">Waiting for the watch</div>`
+          : `<div class="tval" id="homeSteps">${fmtK(st)}</div>
+             <div class="bar thin"><div id="homeStepsBar" style="width:${Math.min(100, (st / goal) * 100)}%;background:${st >= goal ? "var(--green)" : "var(--blue)"}"></div></div>
+             <div class="row small" style="margin-top:7px"><span class="grow muted" id="homeStepsSub">${st >= goal ? "✓ Goal reached" : `${fmtK(goal - st)} to go`}</span><span class="faint">${syncedText()}</span></div>`);
+    } else {
+      html += `<div class="card"><div class="row tile-h"><span class="tic" aria-hidden="true">👟</span><span class="label grow">Steps, sleep and heart rate</span></div>
+        <p class="small muted" style="margin:6px 0 12px">Connect your Fitbit to see them here.</p><button class="btn blue block" data-act="fitConnect">Connect Fitbit</button></div>`;
     }
-    html += card("heart", "❤️", "Heart rate", hv, hs);
+    // calories in, out, and what that leaves
+    const eaten = Math.round(sumN(S.diary.filter(e => e.day === today)).kcal);
+    const out = S.burn.has(today) ? Math.round(S.burn.get(today)) : null;
+    const target = +S.settings.kcal_target || 0;
+    const bal = out != null ? out - eaten : null;
+    html += tile(`data-act="tab" data-v="today" aria-label="Calories today"`, "🍽️", "Calories today",
+      `<div class="kc">
+         <div><div class="tiny dim">In</div><div class="tv2">${fmtK(eaten)}</div></div>
+         <div><div class="tiny dim">Out${out != null ? " so far" : ""}</div><div class="tv2">${out != null ? fmtK(out) : "–"}</div></div>
+         <div><div class="tiny dim">${bal != null && bal < 0 ? "Surplus" : "Deficit"}</div><div class="tv2 ${bal == null ? "" : bal >= 0 ? "down" : "up"}">${bal == null ? "–" : `${bal >= 0 ? "▼" : "▲"} ${fmtK(Math.abs(bal))}`}</div></div>
+       </div>
+       ${target ? `<div class="bar thin" style="margin-top:12px"><div style="width:${Math.min(100, (eaten / target) * 100)}%;background:${eaten > target ? "var(--red)" : "var(--green)"}"></div></div>
+         <div class="small muted" style="margin-top:7px">${eaten > target ? `${fmtK(eaten - target)} over your ${fmtK(target)} target` : `${fmtK(target - eaten)} left of your ${fmtK(target)} target`}</div>` : ""}`);
+    // sleep and heart rate
+    if (fit) {
+      const [sv, ss] = sleepSummary(), [hv, hs] = heartSummary();
+      html += `<div class="grid2 tiles2">${tile(`data-act="hopen" data-p="sleep" aria-label="Sleep"`, "😴", "Sleep", `<div class="tval sm">${sv}</div><div class="small muted">${ss}</div>`)}${tile(`data-act="hopen" data-p="heart" aria-label="Heart rate"`, "❤️", "Heart", `<div class="tval sm">${hv}</div><div class="small muted">${hs}</div>`)}</div>`;
+    }
+    // weight
+    const unit = S.settings.weight_unit || "kg";
+    const ws = S.weights.slice().sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
+    const lastW = ws[ws.length - 1];
+    let wsub = "Tap to log your weight";
+    if (lastW) {
+      const first = ws.find(w => w.day >= addDays(today, -30));
+      wsub = first && first !== lastW ? `${fmtDelta(lastW.kg - first.kg, unit)} in the last 30 days` : dayLabel(lastW.day);
+    }
+    html += tile(`data-act="tab" data-v="weight" aria-label="Weight"`, "⚖️", "Weight", `<div class="tval sm">${lastW ? esc(fmtWeight(lastW.kg, unit)) : "–"}</div><div class="small muted">${esc(wsub)}</div>`);
     return html;
   }
+
+  // ── Hitting the step goal: a cheer (and confetti if it happens while you watch) ──
+  const CHEERS = [
+    "Well done {n}, you smashed it!", "Get in, {n}! Goal done!", "{n}, you absolute legend!", "{goal} steps! Take a bow, {n}.",
+    "Boom! Goal smashed, {n}!", "That's the one, {n}! Goal reached.", "Nailed it, {n}! 👏", "Look at you go, {n}! Goal done.",
+    "{n} 1, step goal 0. 🏆", "Champion stuff, {n}!", "You did it, {n}! Feet up time. 🛋️", "Absolutely flying, {n}!",
+    "Step goal? Sorted. Nice one, {n}!", "Proud of you, {n}! Goal smashed.", "What a star, {n}! ⭐", "{goal} steps done. Unstoppable, {n}!",
+    "High five, {n}! ✋", "Crushed it, {n}!", "Another goal in the bag, {n}!", "Top work, {n}! Your legs deserve a medal. 🏅",
+    "{n} is on fire today! 🔥", "Knocked it out of the park, {n}!", "Well walked, {n}! Goal done.", "Cracking effort, {n}!",
+    "Your step goal never stood a chance, {n}.", "Bravo, {n}! 👏", "Look who hit their goal! Well done, {n}.", "Goal reached. {n}, you're a machine!",
+    "Every step counted, {n}. Brilliant!", "{n}, that's how it's done! 💪", "Stepping like a pro, {n}!", "Tick! Goal done, {n}. ✅",
+    "Legs of steel, {n}! Goal smashed.", "Mission accomplished, {n}! 🚀", "You've earned a sit down, {n}!", "Sterling work, {n}! Goal reached.",
+    "Hats off to you, {n}! 🎩", "{goal}! Nobody does it like {n}.", "Goal reached. Take the rest of the day off, {n}! 😄", "Outstanding, {n}! 🌟",
+  ];
+  const CHEERS_BIG = [   // well past the goal
+    "{steps} steps? {n}, you're on another level!", "Way past your goal, {n}. Show-off! 😄", "Goal? What goal? Incredible, {n}!",
+    "{n}, the treadmill's asking for a break! 😅", "Still going, {n}? Unstoppable! 🔥", "Overachiever alert: {n}! 🚨",
+  ];
+  function cheerLine(shown, goal) {
+    const big = shown >= goal * 1.5, pool = big ? CHEERS_BIG : CHEERS, key = big ? "cheerBig" : "cheer";
+    let i = Math.floor(Math.random() * pool.length);
+    if (String(i) === pref.get(key, "") && pool.length > 1) i = (i + 1) % pool.length;   // not the same one twice running
+    pref.set(key, String(i));
+    const n = (S.settings.display_name || "").trim() || "superstar";
+    return pool[i].replace(/\{n\}/g, n).replace(/\{goal\}/g, fmtK(goal)).replace(/\{steps\}/g, fmtK(shown));
+  }
+  Object.assign(window.CT, { CHEERS, CHEERS_BIG, cheerLine });
+  function confetti() {
+    try { if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return; } catch (e) { /* show it */ }
+    const c = document.createElement("canvas");
+    let g = null;
+    try { g = c.getContext("2d"); } catch (e) { /* no canvas: no confetti */ }
+    if (!g) return;
+    c.className = "confetti";
+    document.body.appendChild(c);
+    const dpr = window.devicePixelRatio || 1, W = window.innerWidth, H = window.innerHeight;
+    c.width = W * dpr; c.height = H * dpr; g.scale(dpr, dpr);
+    const cols = ["#8b7cff", "#ff6fa8", "#4a9eff", "#00c88c", "#ffb84a"];
+    const bits = Array.from({ length: 150 }, () => ({ x: W / 2 + (Math.random() - 0.5) * W * 0.4, y: H * 0.3, vx: (Math.random() - 0.5) * 10, vy: -Math.random() * 11 - 4,
+      r: Math.random() * 6 + 5, a: Math.random() * 6, va: (Math.random() - 0.5) * 0.35, c: cols[Math.floor(Math.random() * cols.length)] }));
+    const t0 = performance.now();
+    (function frame(t) {
+      const k = (t - t0) / 1000;
+      g.clearRect(0, 0, W, H);
+      for (const p of bits) {
+        p.vy += 0.33; p.vx *= 0.99; p.x += p.vx; p.y += p.vy; p.a += p.va;
+        g.save(); g.translate(p.x, p.y); g.rotate(p.a); g.globalAlpha = Math.max(0, 1 - k / 3); g.fillStyle = p.c; g.fillRect(-p.r / 2, -p.r / 4, p.r, p.r / 2); g.restore();
+      }
+      if (k < 3) requestAnimationFrame(frame); else c.remove();
+    })(t0);
+  }
+  const buzz = () => { try { if (navigator.vibrate) navigator.vibrate([70, 50, 150]); } catch (e) { /* no buzz */ } };
 
   // Full-screen pages over the app (the phone's back gesture closes them too).
   const $page = document.getElementById("page");
@@ -630,7 +719,7 @@
     const y = $page.scrollTop;
     $page.classList.remove("hidden");
     const title = { steps: "Steps", sleep: "Sleep", heart: "Heart rate" }[p];
-    const body = S.settings.fit_status === "reauth" ? reauthCard() : !S.settings.fit_status ? viewHealth()
+    const body = S.settings.fit_status === "reauth" ? reauthCard() : !S.settings.fit_status ? `<div class="card"><p class="small muted" style="margin:0 0 12px">Connect your Fitbit to see this.</p><button class="btn blue block" data-act="fitConnect">Connect Fitbit</button></div>`
       : p === "steps" ? pageSteps() : p === "sleep" ? pageSleep() : pageHeart();
     $page.innerHTML = `<div class="pg"><div class="pg-top"><button class="pg-back" data-act="pageBack" aria-label="Back">‹</button><h2>${title}</h2></div>${body}</div>`;
     $page.scrollTop = y;
@@ -638,15 +727,18 @@
   }
   function openPage(p) {
     if (!["steps", "sleep", "heart"].includes(p)) return;
-    Object.assign(S.health, { page: p, shown: null, nightSel: null, hrSel: null, restSel: null });
+    Object.assign(S.health, { page: p, shown: null, cheer: null, nightSel: null, hrSel: null, restSel: null });
     if (p === "steps" && !S.health.live && S.steps.has(isoDay())) S.health.live = { steps: S.steps.get(isoDay()), minutes: [], syncedAt: S.settings.fit_synced_at || null, at: 0 };
     try { history.pushState({ ctPage: p }, ""); } catch (e) { /* not essential */ }
     renderPage();
     $page.scrollTop = 0;
     healthTimers();
     keepAwake(p === "steps");
+    // Counting from old numbers, the first fresh ones could look like the goal being reached
+    // right now: start from the fresh ones instead.
+    const stale = p === "steps" && (!S.health.live || Date.now() - (S.health.live.at || 0) > 60000);
     const load = p === "steps" ? loadLive() : p === "sleep" ? loadSleep(false) : loadHeart(false);
-    load.then(() => { if (S.health.page === p) renderPage(); });
+    load.then(() => { if (S.health.page === p) { if (stale) S.health.shown = null; renderPage(); } });
   }
   function closePage(fromHistory) {
     if (!S.health.page) return;
@@ -675,9 +767,9 @@
   let hTimer = null, tTimer = null;
   function healthTimers() {
     clearInterval(hTimer); clearInterval(tTimer); hTimer = tTimer = null;
-    if (document.hidden || !S.user || S.settings.fit_status !== "linked" || !(S.view === "health" || S.health.page)) return;
+    if (document.hidden || !S.user || S.settings.fit_status !== "linked" || !(S.view === "home" || S.health.page)) return;
     hTimer = setInterval(healthPoll, 20000);
-    if (S.health.page === "steps") tTimer = setInterval(tickLive, 250);
+    if (S.health.page === "steps" || !S.health.page) tTimer = setInterval(tickLive, 250);
   }
   async function healthPoll() {
     const p = S.health.page;
@@ -685,13 +777,13 @@
     else if (p === "sleep") await loadSleep(false);
     else await loadLive();
     if (S.health.page) { if (S.health.page === "steps" && document.getElementById("liveNum")) tickLive(); else renderPage(); }
-    else if (S.view === "health" && !ctx) render();
+    else if (S.view === "home" && !ctx) { render(); tickLive(); }
   }
   async function enterHealth() {
     healthTimers();
     if (S.settings.fit_status !== "linked") return;
     await Promise.all([loadLive(), loadSleep(false), loadHeart(false)]);
-    if (S.view === "health" && !ctx && !S.health.page) render();
+    if (S.view === "home" && !ctx && !S.health.page) { render(); tickLive(); }
   }
   async function hcall(action, extra) {
     const { data, error } = await sb.functions.invoke("fitbit", { body: { action, ...(extra || {}) } });
@@ -735,7 +827,8 @@
   function pageSteps() {
     const lv = S.health.live, goal = stepGoal();
     if (!lv) return loadingCard;
-    return `<div class="card">
+    return `<div class="cheer" id="cheer" hidden><span class="cheer-e" aria-hidden="true">🎉</span><div id="cheerText" role="status" aria-live="polite"></div></div>
+      <div class="card">
         <div class="label">Steps today</div>
         <div class="hero" id="liveNum">${fmtK(lv.steps)}</div>
         <div class="bar hero-bar"><div id="liveBar"></div></div>
@@ -750,10 +843,29 @@
   }
   function tickLive() {
     const lv = S.health.live, el = id => document.getElementById(id);
-    if (!lv || S.health.page !== "steps" || !el("liveNum")) return;
+    if (!lv || lv.day && lv.day !== isoDay()) return;
+    const onPage = S.health.page === "steps" && el("liveNum"), onHome = !S.health.page && S.view === "home" && el("homeSteps");
+    if (!onPage && !onHome) return;
     const now = Date.now(), goal = stepGoal();
-    const pace = paceOf(lv.minutes, lv.syncedAt);
-    const shown = S.health.shown = liveShown(S.health.shown, liveEstimate(lv.steps, pace, lv.syncedAt, now), pace);
+    const pace = paceOf(lv.minutes, lv.syncedAt), prev = S.health.shown;
+    const shown = S.health.shown = liveShown(prev, liveEstimate(lv.steps, pace, lv.syncedAt, now), pace);
+    if (onHome) {
+      el("homeSteps").textContent = fmtK(shown);
+      el("homeStepsBar").style.width = Math.min(100, (shown / goal) * 100) + "%";
+      el("homeStepsBar").style.background = shown >= goal ? "var(--green)" : "var(--blue)";
+      el("homeStepsSub").textContent = shown >= goal ? "✓ Goal reached" : `${fmtK(goal - shown)} to go`;
+      return;
+    }
+    if (shown >= goal) {   // the goal: a cheer, with confetti if it happened while you watched
+      const crossed = prev != null && prev < goal;
+      if (!S.health.cheer || crossed) S.health.cheer = cheerLine(shown, goal);
+      const c = el("cheer");
+      if (c && (c.hidden || crossed || el("cheerText").textContent !== S.health.cheer)) {
+        c.hidden = false;
+        el("cheerText").textContent = S.health.cheer;
+        if (crossed) { c.classList.remove("pop"); void c.offsetWidth; c.classList.add("pop"); confetti(); buzz(); }
+      }
+    }
     el("liveNum").textContent = fmtK(shown);
     el("liveBar").style.width = Math.min(100, (shown / goal) * 100) + "%";
     el("liveBar").style.background = shown >= goal ? "var(--green)" : "var(--blue)";
@@ -952,8 +1064,9 @@
   const sortBar = () => `<div class="sortbar">${segHtml([["az", "A–Z"], ["used", "Most used"]], S.sort, "sortBy")}</div>`;
   const fixedOf = f => (+f.fixed_amount > 0 ? +f.fixed_amount : 0);
 
+  const libBar = () => `<div class="sortbar">${segHtml([["foods", "Foods"], ["dishes", "Dishes"]], S.view, "libTab")}</div>`;
   function viewFoods() {
-    return `<div class="row" style="margin-bottom:10px">
+    return libBar() + `<div class="row" style="margin-bottom:10px">
         <input class="inp grow" id="foodSearch" data-live="foodSearch" placeholder="Search foods" value="${esc(S.foodQuery)}" autocomplete="off">
         <button class="btn blue" data-act="scan" data-from="foods" style="padding:10px 12px">Scan</button>
         <button class="btn primary" data-act="newFood" style="padding:10px 14px">+ New</button></div>
@@ -973,7 +1086,7 @@
   const sharedNote = `<div class="tiny faint" style="text-align:center;margin:-4px 0 12px">Shared with your household · diaries stay private</div>`;
 
   function viewDishes() {
-    let html = `<button class="btn primary block" data-act="newDish" style="margin-bottom:12px">+ New dish</button>`;
+    let html = libBar() + `<button class="btn primary block" data-act="newDish" style="margin-bottom:12px">+ New dish</button>`;
     if (!S.dishes.length) return html + `<div class="card empty">No dishes yet. A dish is a recipe made from your foods: add the ingredients and it works out the calories and macros per portion.</div>`;
     const fb = foodsById();
     if (S.dishes.length > 1) html += sortBar();
@@ -1308,6 +1421,7 @@
     const tIn = (k, label) => `<div><span class="label" style="display:block;margin-bottom:4px">${label}</span>
       <input class="inp" id="t_${k}" type="number" inputmode="decimal" step="any" value="${st[k + "_target"] != null ? esc(st[k + "_target"]) : ""}" placeholder="—"></div>`;
     showSheet(`${closeX}<h3>Settings</h3>
+      <div class="field"><span class="label">Your name</span><input class="inp" id="dispName" maxlength="40" autocomplete="given-name" value="${esc(st.display_name || "")}" placeholder="e.g. Hollie"></div>
       <div class="label" style="margin-bottom:6px">Daily targets</div>
       <div class="grid4" style="margin-bottom:12px">${tIn("kcal", "kcal")}${tIn("protein", "Protein g")}${tIn("carbs", "Carbs g")}${tIn("fat", "Fat g")}</div>
       <div class="field"><span class="label">Weight in</span>${segHtml([["kg", "Kilograms"], ["stlb", "Stones & pounds"]], unit, "setUnit")}</div>
@@ -1320,7 +1434,7 @@
           : `<span class="grow small muted">See the calories you burn, your steps, sleep and heart rate, from your Fitbit.</span><button class="btn blue sm" data-act="fitConnect">Connect</button>`}</div>
         ${st.fit_status === "linked" && !(hasScope("sleep") && hasScope("heart")) ? `<div class="row" style="margin-top:8px"><span class="grow small" style="color:var(--amber)">Sleep and heart rate need one more permission.</span><button class="btn blue sm" data-act="fitConnect">Allow</button></div>` : ""}</div>
       ${st.fit_status === "linked" ? `<div class="field" id="remindBox">${remindHtml()}</div>` : ""}
-      <div class="row" style="margin-top:16px"><span class="grow tiny faint">CalorieTracker v${APP_VERSION}${S.user && S.user.email ? " · " + esc(S.user.email) : ""}</span>
+      <div class="row" style="margin-top:16px"><span class="grow tiny faint">Vitals v${APP_VERSION}${S.user && S.user.email ? " · " + esc(S.user.email) : ""}</span>
         <button class="btn ghost" data-act="signOut" style="padding:8px 12px;font-size:12px">Sign out</button></div>`);
     if (st.fit_status === "linked") checkPush();
   }
@@ -1381,7 +1495,7 @@
     if (box && ctx && ctx.kind === "settings") box.innerHTML = remindHtml();
   }
   async function remindOn(hour) {
-    if (!pushSupported()) throw oops(onIOS() ? "On iPhone, add CalorieTracker to your Home Screen first, then open it from there." : "This browser can't show notifications.");
+    if (!pushSupported()) throw oops(onIOS() ? "On iPhone, add Vitals to your Home Screen first, then open it from there." : "This browser can't show notifications.");
     const perm = await Notification.requestPermission();   // first, while it's still the tap that asked
     S.push.perm = perm;
     if (perm !== "granted") throw oops(perm === "denied" ? "Notifications are blocked — allow them for this app in your phone's settings." : "Reminders need notifications to be allowed.");
@@ -1592,7 +1706,12 @@
   const A = {
     closeVeil: (el, ev) => { if (ev.target === el) closeSheet(); },
     closeSheet: () => closeSheet(),
-    tab: el => { S.view = el.dataset.v; closeSheet(); render(); window.scrollTo(0, 0); healthTimers(); if (S.view === "health") enterHealth(); },
+    tab: el => {
+      S.view = el.dataset.v === "library" ? S.lib : el.dataset.v;
+      closeSheet(); render(); window.scrollTo(0, 0);
+      healthTimers(); if (S.view === "home") enterHealth();
+    },
+    libTab: el => { S.view = S.lib = el.dataset.k === "dishes" ? "dishes" : "foods"; pref.set("lib", S.lib); render(); },
     hopen: el => openPage(el.dataset.p),
     pageBack: () => closePage(false),
     nightSel: el => { S.health.nightSel = +el.dataset.i; renderPage(); },
@@ -1892,6 +2011,8 @@
       const goal = readWeight(ctx.unit, "g");
       const row = { user_id: S.user.id, kcal_target: t("kcal"), protein_target: t("protein"), carbs_target: t("carbs"), fat_target: t("fat"),
         goal_kg: goal > 0 ? goal : null, weight_unit: ctx.unit, updated_at: new Date().toISOString() };
+      const dn = document.getElementById("dispName");
+      if (dn) row.display_name = dn.value.trim().slice(0, 40) || null;
       const sg = document.getElementById("stepGoal");
       if (sg) {
         const v = num(sg.value);
@@ -1986,7 +2107,8 @@
     S.user = u;
     S.push = { checked: false };
     if (S.health.page) closePage(true);
-    S.health = { page: null, live: null, sleep: null, heart: null, shown: null, nightSel: null, hrSel: null, restSel: null };
+    S.health = { page: null, live: null, sleep: null, heart: null, shown: null, cheer: null, nightSel: null, hrSel: null, restSel: null };
+    S.view = "home";
     closeSheet();
     if (!u) { S.loading = false; render(); return; }
     S.loading = true; render();
@@ -1996,6 +2118,7 @@
     if (fitReturn) { const [msg, bad] = FIT_MSG[fitReturn]; fitReturn = null; toast(msg, bad); }
     syncBurn();
     healPush();
+    if (S.view === "home") enterHealth();
   }
 
   // Foods and dishes are shared, so fetch them again when coming back to the app
@@ -2020,7 +2143,7 @@
     if (t !== lastToday) { if (S.day === lastToday) S.day = t; lastToday = t; if (S.user && !ctx) render(); }
     if (S.user && !S.loading && !ctx && hiddenAt && Date.now() - hiddenAt > 60 * 1000) refreshShared();
     if (S.user && !S.loading) syncBurn();   // at most every 2 minutes
-    if (S.user && !S.loading && (S.health.page || S.view === "health")) { healthTimers(); healthPoll(); if (S.health.page === "steps") keepAwake(true); }
+    if (S.user && !S.loading && (S.health.page || S.view === "home")) { healthTimers(); healthPoll(); if (S.health.page === "steps") keepAwake(true); }
     hiddenAt = 0;
   });
 
