@@ -1,14 +1,17 @@
 /* CalorieTracker — foods, dishes built from those foods, a daily diary with
    calories and macros, and body weight. Plain JavaScript with no build step.
    Data lives in Supabase (the ct_* tables). Foods and dishes are one list shared
-   by the household; diary, weights and settings are private to each login. */
+   by the household; diary, weights and settings are private to each login.
+   Barcodes are looked up in the household's foods first, then Open Food Facts. */
 (function () {
   "use strict";
 
-  const APP_VERSION = "1.1.0";
+  const APP_VERSION = "1.2.0";
   const SUPABASE_URL = "https://yfbarahnwcrwewtpithb.supabase.co";
   const SUPABASE_KEY = "sb_publishable_ItUAbr04KIijWuO-JWgDNg_J5YCwaqK";
   const DIARY_DAYS = 120;   // diary history loaded up front; older days load when opened
+  const OFF_URL = "https://world.openfoodfacts.org/api/v2/product/";   // free, open product database
+  const OFF_FIELDS = "product_name,product_name_en,generic_name,brands,quantity,product_quantity,product_quantity_unit,serving_quantity,nutriments";
 
   const MEALS = [["breakfast", "Breakfast"], ["lunch", "Lunch"], ["dinner", "Dinner"], ["snacks", "Snacks"]];
   const mealName = k => (MEALS.find(m => m[0] === k) || [k, k])[1];
@@ -95,11 +98,50 @@
   const macroLine = n => `<span class="p"><b>P</b> ${fmtG(n.protein)}</span> · <span class="c"><b>C</b> ${fmtG(n.carbs)}</span> · <span class="f"><b>F</b> ${fmtG(n.fat)}</span>`;
   const byName = list => [...list].sort((a, b) => a.name.localeCompare(b.name, "en", { sensitivity: "base" }));
 
+  // ── Barcodes ──────────────────────────────────────────────────────────────
+  // Digits only; a 12-digit UPC-A is kept as the same code's 13-digit EAN form.
+  function normCode(raw) {
+    const c = String(raw == null ? "" : raw).replace(/\D/g, "");
+    return c.length === 12 ? "0" + c : c;
+  }
+  // EAN-8 / EAN-13 / GTIN-14 check digit.
+  function validCode(c) {
+    if (!/^(\d{8}|\d{13}|\d{14})$/.test(c)) return false;
+    const d = c.split("").map(Number);
+    const check = d.pop();
+    const sum = d.reverse().reduce((s, n, i) => s + n * (i % 2 === 0 ? 3 : 1), 0);
+    return (10 - (sum % 10)) % 10 === check;
+  }
+  // An Open Food Facts product -> what the food form needs (values per 100 g / 100 ml).
+  function offToFood(p) {
+    const n = (p && p.nutriments) || {};
+    const val = k => { const v = parseFloat(n[k]); return isFinite(v) && v >= 0 ? v : null; };
+    let kcal = val("energy-kcal_100g");
+    if (kcal == null) { const kj = val("energy-kj_100g") != null ? val("energy-kj_100g") : val("energy_100g"); if (kj != null) kcal = kj / 4.184; }
+    const brand = String((p && p.brands) || "").split(",")[0].trim();
+    let name = String((p && (p.product_name_en || p.product_name || p.generic_name)) || "").replace(/\s+/g, " ").trim();
+    if (brand && !name.toLowerCase().includes(brand.toLowerCase())) name = (brand + " " + name).trim();
+    const unit = /^(ml|cl|l)$/i.test(String((p && p.product_quantity_unit) || "")) || /\d\s*(ml|cl|l|litres?|liters?)\b/i.test(String((p && p.quantity) || "")) ? "ml" : "g";
+    const vals = kcal == null ? null
+      : { kcal: round1(kcal), protein: round1(val("proteins_100g") || 0), carbs: round1(val("carbohydrates_100g") || 0), fat: round1(val("fat_100g") || 0) };
+    // A pack that is exactly one serving (a pot, a bar, a noodle pack) makes a natural fixed portion.
+    const pack = parseFloat(p && p.product_quantity), serving = parseFloat(p && p.serving_quantity);
+    const fixed = pack > 0 && serving > 0 && Math.abs(pack - serving) < 0.5 ? round1(pack) : null;
+    return { name: name.slice(0, 80), unit, vals, fixed };
+  }
+
   // Exposed for tests.
-  window.CT = { zero, addN, scaleN, sumN, basisOf, foodFor, toStored, dishTotals, dishFor, kgToStLb, stLbToKg, fmtWeight, fmtDelta, isoDay, addDays, dayLabel, esc, APP_VERSION };
+  window.CT = { zero, addN, scaleN, sumN, basisOf, foodFor, toStored, dishTotals, dishFor, kgToStLb, stLbToKg, fmtWeight, fmtDelta, isoDay, addDays, dayLabel, esc, normCode, validCode, offToFood, APP_VERSION };
+
+  // Small per-device preferences, such as list order. Storage can be unavailable, so nothing depends on it.
+  const pref = {
+    get(k, d) { try { return window.localStorage.getItem("ct." + k) || d; } catch (e) { return d; } },
+    set(k, v) { try { window.localStorage.setItem("ct." + k, v); } catch (e) { /* not saved on this device */ } },
+  };
 
   // ── State ─────────────────────────────────────────────────────────────────
-  const S = { user: null, loading: true, view: "today", day: isoDay(), foods: [], dishes: [], diary: [], diaryFrom: null, weights: [], settings: {}, foodQuery: "" };
+  const S = { user: null, loading: true, view: "today", day: isoDay(), foods: [], dishes: [], diary: [], diaryFrom: null, weights: [], settings: {}, foodQuery: "",
+    sort: pref.get("sort", "az") === "used" ? "used" : "az" };
   const foodsById = () => Object.fromEntries(S.foods.map(f => [f.id, f]));
   let sb = null;
   let ctx = null;   // what the open sheet is doing
@@ -213,20 +255,34 @@
     return html;
   }
 
+  // A–Z, or most used first: how often you've logged each one (your own diary).
+  function sorted(list) {
+    const out = byName(list);
+    if (S.sort !== "used") return out;
+    const n = new Map();
+    for (const e of S.diary) if (e.ref_id) n.set(e.ref_id, (n.get(e.ref_id) || 0) + 1);
+    return out.sort((a, b) => (n.get(b.id) || 0) - (n.get(a.id) || 0));   // ties stay A–Z
+  }
+  const sortBar = () => `<div class="sortbar">${segHtml([["az", "A–Z"], ["used", "Most used"]], S.sort, "sortBy")}</div>`;
+  const fixedOf = f => (+f.fixed_amount > 0 ? +f.fixed_amount : 0);
+
   function viewFoods() {
     return `<div class="row" style="margin-bottom:10px">
         <input class="inp grow" id="foodSearch" data-live="foodSearch" placeholder="Search foods" value="${esc(S.foodQuery)}" autocomplete="off">
+        <button class="btn blue" data-act="scan" data-from="foods" style="padding:10px 12px">Scan</button>
         <button class="btn primary" data-act="newFood" style="padding:10px 14px">+ New</button></div>
+      ${S.foods.length > 1 ? sortBar() : ""}
       <div id="foodList">${foodListHtml()}</div>`;
   }
   function foodListHtml() {
-    if (!S.foods.length) return `<div class="card empty">No foods yet. Add one straight from the packet — the calories and macros for a weight, like per 100 g.</div>`;
+    if (!S.foods.length) return `<div class="card empty">No foods yet. Scan a barcode, or add one straight from the packet — the calories and macros for a weight, like per 100 g.</div>`;
     const q = S.foodQuery.trim().toLowerCase();
-    const list = byName(S.foods).filter(f => !q || f.name.toLowerCase().includes(q));
+    const list = sorted(S.foods).filter(f => !q || f.name.toLowerCase().includes(q));
     if (!list.length) return `<div class="card empty">No foods match “${esc(S.foodQuery)}”.</div>`;
     return `<div class="list">${list.map(f => `<div class="item tap" data-act="editFood" data-id="${f.id}">
       <div class="grow"><div class="name ellip">${esc(f.name)}</div><div class="macros">${macroLine(f)}</div></div>
-      <div style="text-align:right"><div class="kcal">${fmtK(f.kcal)}</div><div class="tiny faint">per ${basisText(f.unit)}</div></div></div>`).join("")}</div>${sharedNote}`;
+      <div style="text-align:right"><div class="kcal">${fmtK(f.kcal)}</div><div class="tiny faint">per ${basisText(f.unit)}</div>
+        ${fixedOf(f) ? `<div class="tiny fixed">fixed ${esc(amountText(fixedOf(f), f.unit))}</div>` : ""}</div></div>`).join("")}</div>${sharedNote}`;
   }
   const sharedNote = `<div class="tiny faint" style="text-align:center;margin:-4px 0 12px">Shared with your household · diaries stay private</div>`;
 
@@ -234,7 +290,8 @@
     let html = `<button class="btn primary block" data-act="newDish" style="margin-bottom:12px">+ New dish</button>`;
     if (!S.dishes.length) return html + `<div class="card empty">No dishes yet. A dish is a recipe made from your foods: add the ingredients and it works out the calories and macros per portion.</div>`;
     const fb = foodsById();
-    html += `<div class="list">${byName(S.dishes).map(d => {
+    if (S.dishes.length > 1) html += sortBar();
+    html += `<div class="list">${sorted(S.dishes).map(d => {
       const t = dishTotals(d, fb);
       const per = scaleN(t, 1 / (+d.portions || 1));
       const n = (d.items || []).length;
@@ -316,7 +373,7 @@
   function showSheet(html) {
     $sheet.innerHTML = `<div class="veil" data-act="closeVeil"><div class="sheet">${html}</div></div>`;
   }
-  function closeSheet() { ctx = null; $sheet.innerHTML = ""; }
+  function closeSheet() { stopScan(); ctx = null; $sheet.innerHTML = ""; }
   const closeX = `<button class="iconbtn x" data-act="closeSheet" aria-label="Close">✕</button>`;
   const segHtml = (opts, cur, act) => `<div class="seg">${opts.map(([k, l]) => `<button type="button" data-act="${act}" data-k="${k}" class="${cur === k ? "on" : ""}">${l}</button>`).join("")}</div>`;
   const nutPreview = (n, note) => `<div class="row"><div class="grow"><div class="label">${note}</div><div class="macros" style="margin-top:4px">${macroLine(n)}</div></div><div class="kcal" style="font-size:18px">${fmtK(n.kcal)} <span class="tiny dim">kcal</span></div></div>`;
@@ -333,7 +390,8 @@
   }
   function pickHtml() {
     return `${closeX}<h3>Add to ${esc(mealName(ctx.meal))}</h3>
-      <input class="inp search" data-live="pickSearch" placeholder="Search foods and dishes" value="${esc(ctx.q)}" autocomplete="off">
+      <div class="row search"><input class="inp grow" data-live="pickSearch" placeholder="Search foods and dishes" value="${esc(ctx.q)}" autocomplete="off">
+        <button class="btn blue" data-act="scan" data-from="pick" style="padding:10px 12px">Scan</button></div>
       <div id="pickList">${pickListHtml()}</div>`;
   }
   function pickListHtml() {
@@ -351,17 +409,58 @@
     if (!all.length) return `<div class="empty">Nothing matches.</div>${newBtn}`;
     const fb = foodsById();
     return `<div class="list">${all.slice(0, 80).map(x => {
-      const per = x.kind === "food" ? x.obj : scaleN(dishTotals(x.obj, fb), 1 / (+x.obj.portions || 1));
+      const fixed = x.kind === "food" ? fixedOf(x.obj) : 0;
+      const per = x.kind === "food" ? (fixed ? foodFor(x.obj, fixed) : x.obj) : scaleN(dishTotals(x.obj, fb), 1 / (+x.obj.portions || 1));
+      const note = fixed ? `<div class="tiny fixed">adds ${esc(amountText(fixed, x.obj.unit))}</div>`
+        : `<div class="tiny faint">per ${x.kind === "food" ? basisText(x.obj.unit) : "portion"}</div>`;
       return `<div class="item tap" data-act="pick" data-kind="${x.kind}" data-id="${x.obj.id}">
         <div class="grow"><div class="name ellip">${esc(x.obj.name)}${x.kind === "dish" ? ` <span class="tiny" style="color:var(--amber)">dish</span>` : ""}</div><div class="macros">${macroLine(per)}</div></div>
-        <div style="text-align:right"><div class="kcal">${fmtK(per.kcal)}</div><div class="tiny faint">per ${x.kind === "food" ? basisText(x.obj.unit) : "portion"}</div></div></div>`;
+        <div style="text-align:right"><div class="kcal">${fmtK(per.kcal)}</div>${note}</div></div>`;
     }).join("")}</div>${newBtn}`;
+  }
+  // The amount you last logged for this food or dish (in `unit`, if given).
+  function lastLogged(id, unit) {
+    let best = null;
+    for (const e of S.diary) {
+      if (e.ref_id !== id || !(+e.amount > 0) || (unit && e.amount_unit !== unit)) continue;
+      if (!best || String(e.created_at || e.day) > String(best.created_at || best.day)) best = e;
+    }
+    return best;
+  }
+  // Foods with a fixed portion go straight into the diary; everything else asks how much.
+  function pickItem(kind, id, meal) {
+    const f = kind === "food" ? S.foods.find(x => x.id === id) : null;
+    if (f && fixedOf(f)) return quickAdd(f, meal);
+    openAmount(kind, id, meal);
+  }
+  let adding = false;
+  async function quickAdd(food, meal) {
+    if (adding) return;   // ignore a double tap
+    adding = true;
+    try {
+      await busy(null, async () => {
+        const amount = fixedOf(food);
+        const row = { user_id: S.user.id, day: S.day, meal, kind: "food", ref_id: food.id, name: food.name, amount, amount_unit: food.unit, ...roundN(foodFor(food, amount)) };
+        const saved = await run(() => sb.from("ct_diary").insert(row).select().single());
+        S.diary.push(saved);
+        closeSheet(); render(); addedToast(saved);
+      });
+    } finally { adding = false; }
   }
   function openAmount(kind, id, meal) {
     const obj = kind === "food" ? S.foods.find(f => f.id === id) : S.dishes.find(d => d.id === id);
     if (!obj) return;
-    const unit = kind === "food" ? obj.unit : "portion";
-    ctx = { kind: "amount", item: kind, id, meal, unit, amount: kind === "food" ? basisOf(obj.unit) : 1 };
+    let unit, amount;
+    if (kind === "food") {
+      unit = obj.unit;
+      const last = lastLogged(id, unit);
+      amount = last ? +last.amount : basisOf(unit);
+    } else {
+      const last = lastLogged(id);
+      unit = last && (last.amount_unit === "portion" || (last.amount_unit === "g" && obj.cooked_grams)) ? last.amount_unit : "portion";
+      amount = last && last.amount_unit === unit ? +last.amount : 1;
+    }
+    ctx = { kind: "amount", item: kind, id, meal, unit, amount };
     showSheet(amountHtml());
   }
   function amountNut() {
@@ -406,11 +505,17 @@
   }
 
   // Food form. Values are typed exactly as on the label, for whatever weight it shows.
+  // `opts` can pre-fill a new food (from a scan) and say what to do after saving.
   function openFood(food, opts = {}) {
+    const unit = food ? food.unit : opts.unit || "g";
+    const v = food || opts.vals;
     ctx = {
-      kind: "food", id: food ? food.id : null, then: opts.then || null,
-      name: food ? food.name : opts.name || "", unit: food ? food.unit : "g", basis: food ? basisOf(food.unit) : 100,
-      vals: food ? { kcal: food.kcal, protein: food.protein, carbs: food.carbs, fat: food.fat } : { kcal: "", protein: "", carbs: "", fat: "" },
+      kind: "food", id: food ? food.id : null, then: opts.then || null, note: opts.note || "",
+      name: food ? food.name : opts.name || "", unit, basis: basisOf(unit),
+      vals: v ? { kcal: v.kcal, protein: v.protein, carbs: v.carbs, fat: v.fat } : { kcal: "", protein: "", carbs: "", fat: "" },
+      barcode: (food ? food.barcode : opts.barcode) || "",
+      fixedOn: food ? !!fixedOf(food) : +opts.fixed > 0,
+      fixed: food ? (fixedOf(food) || "") : (+opts.fixed > 0 ? opts.fixed : ""),
     };
     showSheet(foodHtml());
   }
@@ -426,14 +531,22 @@
     const valIn = (k, label) => `<div><span class="label" style="display:block;margin-bottom:4px">${label}</span>
       <input class="inp" data-live="fVal" data-k="${k}" type="number" inputmode="decimal" step="any" value="${esc(v[k])}" placeholder="0"></div>`;
     const pv = foodStoredPreview();
+    const unitLabel = ctx.unit === "item" ? "item(s)" : ctx.unit;
     return `${closeX}<h3>${ctx.id ? "Edit food" : "New food"}</h3>
+      ${ctx.note ? `<div class="note">${esc(ctx.note)}</div>` : ""}
       <div class="field"><span class="label">Name</span><input class="inp" id="fName" data-live="fName" value="${esc(ctx.name)}" placeholder="e.g. Greek yoghurt" autocomplete="off"></div>
       <div class="field"><span class="label">Measured in</span>${segHtml([["g", "Grams"], ["ml", "Millilitres"], ["item", "Items"]], ctx.unit, "fUnit")}</div>
       <div class="field"><span class="label">Values for</span><div class="row">
         <input class="inp" id="fBasis" data-live="fBasis" type="number" inputmode="decimal" step="any" value="${esc(ctx.basis)}" style="max-width:100px">
-        <span class="muted">${ctx.unit === "item" ? "item(s)" : ctx.unit}</span><span class="tiny faint grow">as on the label</span></div></div>
+        <span class="muted">${unitLabel}</span><span class="tiny faint grow">as on the label</span></div></div>
       <div class="grid4" style="margin-bottom:11px">${valIn("kcal", "kcal")}${valIn("protein", "Protein")}${valIn("carbs", "Carbs")}${valIn("fat", "Fat")}</div>
       <div class="preview${pv ? "" : " hidden"}" id="fpv">${pv}</div>
+      <div class="field"><span class="label">Portion</span>${segHtml([["choose", "Choose each time"], ["fixed", "Always the same"]], ctx.fixedOn ? "fixed" : "choose", "fFixedMode")}
+        ${ctx.fixedOn ? `<div class="row" style="margin-top:8px"><input class="inp" id="fFixed" data-live="fFixed" type="number" inputmode="decimal" step="any" value="${esc(ctx.fixed)}" placeholder="e.g. 70" style="max-width:100px">
+          <span class="muted">${unitLabel}</span><span class="tiny faint grow">added in one tap</span></div>` : ""}</div>
+      <div class="field"><span class="label">Barcode</span><div class="row">
+        ${ctx.barcode ? `<span class="grow small" style="color:var(--soft)">${esc(ctx.barcode)}</span><button class="btn ghost sm" data-act="fBarcodeClear">Remove</button>`
+                      : `<span class="grow tiny faint">Link one so a scan finds this food</span><button class="btn blue sm" data-act="scan" data-from="link">Scan</button>`}</div></div>
       ${ctx.id ? `<div class="grid2"><button class="btn danger" data-act="deleteFood">Delete</button><button class="btn primary" data-act="saveFood">Save</button></div>`
                : `<button class="btn primary block" data-act="saveFood">Save food</button>`}`;
   }
@@ -518,12 +631,173 @@
         <button class="btn ghost" data-act="signOut" style="padding:8px 12px;font-size:12px">Sign out</button></div>`);
   }
 
+  // ── Barcode scanner ───────────────────────────────────────────────────────
+  // Opened from the Add sheet ("pick": log it), the Foods tab ("foods": add or
+  // edit it) or the food form ("link": attach the barcode to that food).
+  let scan = null;   // the running camera session
+  function openScan(from) {
+    stopScan();
+    const back = ctx && (ctx.kind === "pick" || ctx.kind === "food") ? ctx : null;
+    ctx = { kind: "scan", from, back, meal: back && back.meal };
+    showSheet(`<button class="iconbtn x" data-act="scanBack" aria-label="Close">✕</button><h3>Scan a barcode</h3>
+      <div class="scanbox" id="scanBox"><video id="scanVideo" playsinline muted autoplay></video><div class="scanguide"></div></div>
+      <div class="small muted" id="scanMsg" style="text-align:center;margin:9px 0 12px">Starting the camera…</div>
+      <div class="row"><input class="inp grow" id="scanCode" inputmode="numeric" autocomplete="off" placeholder="Or type the barcode number">
+        <button class="btn blue" data-act="scanManual">Find</button></div>`);
+    startScan();
+  }
+  const scanMsg = t => { const m = document.getElementById("scanMsg"); if (m) m.textContent = t; };
+  function stopScan() {
+    if (!scan) return;
+    clearTimeout(scan.timer);
+    if (scan.stream) scan.stream.getTracks().forEach(t => t.stop());
+    const v = document.getElementById("scanVideo");
+    if (v) v.srcObject = null;
+    scan = null;
+  }
+  async function startScan() {
+    stopScan();
+    const me = { stream: null, timer: null };
+    scan = me;
+    const box = document.getElementById("scanBox");
+    if (box) box.classList.remove("off");
+    const live = () => scan === me && ctx && ctx.kind === "scan";
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw Object.assign(new Error("no camera"), { name: "NoCamera" });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } } });
+      if (!live()) { stream.getTracks().forEach(t => t.stop()); return; }
+      me.stream = stream;
+      const video = document.getElementById("scanVideo");
+      if (!video) { stopScan(); return; }
+      video.muted = true;
+      video.setAttribute("playsinline", "");   // iPhone: play inside the page, not full screen
+      video.srcObject = stream;
+      await video.play().catch(() => {});
+      const decode = await makeDecoder();
+      if (!live()) return;
+      scanMsg("Line the barcode up with the red line");
+      const tick = async () => {
+        if (!live()) return;
+        let raw = null;
+        try { raw = await decode(video); } catch (e) { raw = null; }
+        if (!live()) return;
+        const code = raw ? normCode(raw) : "";
+        if (code && validCode(code)) {
+          stopScan();
+          if (navigator.vibrate) navigator.vibrate(60);
+          findCode(code);
+          return;
+        }
+        me.timer = setTimeout(tick, 150);
+      };
+      tick();
+    } catch (e) {
+      if (!live()) return;
+      stopScan();
+      if (box) box.classList.add("off");
+      scanMsg(e && (e.name === "NotAllowedError" || e.name === "SecurityError") ? "Camera access is off for this app — allow it in your phone's settings, or type the number below."
+        : e && e.name === "ScannerLoad" ? "Couldn't load the scanner — check your connection, or type the number below."
+        : "No camera available — type the number below.");
+    }
+  }
+  // The phone's own barcode reader where there is one (Android); otherwise the
+  // ZXing decoder, downloaded the first time it's needed (iPhone).
+  async function makeDecoder() {
+    if ("BarcodeDetector" in window) {
+      try {
+        const have = await window.BarcodeDetector.getSupportedFormats();
+        const want = ["ean_13", "ean_8", "upc_a"].filter(f => have.includes(f));
+        if (want.length) {
+          const det = new window.BarcodeDetector({ formats: want });
+          return async video => { const r = await det.detect(video); return r.length ? r[0].rawValue : null; };
+        }
+      } catch (e) { /* use ZXing instead */ }
+    }
+    if (!window.ZXing) {
+      await new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = "/vendor/zxing.min.js";
+        s.onload = resolve;
+        s.onerror = () => reject(Object.assign(new Error("scanner didn't load"), { name: "ScannerLoad" }));
+        document.head.appendChild(s);
+      });
+    }
+    const Z = window.ZXing;
+    const hints = new Map();
+    hints.set(Z.DecodeHintType.POSSIBLE_FORMATS, [Z.BarcodeFormat.EAN_13, Z.BarcodeFormat.EAN_8, Z.BarcodeFormat.UPC_A]);
+    hints.set(Z.DecodeHintType.TRY_HARDER, true);
+    const reader = new Z.MultiFormatReader();
+    reader.setHints(hints);
+    const canvas = document.createElement("canvas");
+    const g = canvas.getContext("2d", { willReadFrequently: true });
+    return async video => {
+      const vw = video.videoWidth, vh = video.videoHeight;
+      if (!vw || !vh) return null;
+      // The middle of the picture, around the guide line, at most 800 px wide.
+      const sw = Math.round(vw * 0.8), sh = Math.round(vh * 0.5);
+      const k = Math.min(1, 800 / sw);
+      canvas.width = Math.round(sw * k); canvas.height = Math.round(sh * k);
+      g.drawImage(video, Math.round((vw - sw) / 2), Math.round((vh - sh) / 2), sw, sh, 0, 0, canvas.width, canvas.height);
+      try {
+        return reader.decodeWithState(new Z.BinaryBitmap(new Z.HybridBinarizer(new Z.HTMLCanvasElementLuminanceSource(canvas)))).getText();
+      } catch (e) { return null; }   // no barcode in this frame
+    };
+  }
+  async function lookupOFF(code) {
+    const ctl = typeof AbortController === "function" ? new AbortController() : null;
+    const timer = setTimeout(() => { if (ctl) ctl.abort(); }, 9000);
+    try {
+      const res = await fetch(`${OFF_URL}${code}.json?fields=${OFF_FIELDS}`, ctl ? { signal: ctl.signal } : {});
+      if (res.status === 404) return null;
+      if (!res.ok) throw new Error("lookup failed " + res.status);
+      const j = await res.json();
+      return j && j.product && j.status !== 0 ? j.product : null;
+    } finally { clearTimeout(timer); }
+  }
+  // A barcode was read (or typed): household foods first, then Open Food Facts.
+  async function findCode(code) {
+    const c = ctx;
+    if (!c || c.kind !== "scan") return;
+    if (c.from === "link") {
+      const other = S.foods.find(f => f.barcode === code && f.id !== c.back.id);
+      ctx = c.back;
+      if (!other) ctx.barcode = code;
+      showSheet(foodHtml());
+      toast(other ? `That barcode is already on “${other.name}”.` : "Barcode added — tap Save to keep it", !!other);
+      return;
+    }
+    scanMsg(`Looking up ${code}…`);
+    let food = S.foods.find(f => f.barcode === code);
+    let product = null, failed = false;
+    try {
+      if (!food) {   // the other person may have added it since the list was loaded
+        const rows = await run(() => sb.from("ct_foods").select("*").eq("barcode", code));
+        food = rows && rows[0];
+        if (food) S.foods = S.foods.filter(f => f.id !== food.id).concat(food);
+      }
+      if (!food) product = await lookupOFF(code);
+    } catch (e) { failed = true; }
+    if (ctx !== c) return;   // closed while looking it up
+    if (food) return c.from === "pick" ? pickItem("food", food.id, c.meal) : openFood(food, { note: "Already in your foods." });
+    const then = c.from === "pick" ? { meal: c.meal } : null;
+    if (failed) return openFood(null, { barcode: code, then, note: "Couldn't look it up just now. Enter it from the label — the barcode is saved with it." });
+    if (!product) return openFood(null, { barcode: code, then, note: "Not in the product database yet. Enter it from the label once — next time the scan finds it." });
+    const p = offToFood(product);
+    openFood(null, { barcode: code, then, name: p.name, unit: p.unit, vals: p.vals, fixed: p.fixed,
+      note: p.vals ? "Filled in from Open Food Facts — check it against the label, then save." : "Found the name but no nutrition info — enter it from the label." });
+  }
+
   // ── Toast ─────────────────────────────────────────────────────────────────
   let toastTimer = null;
-  function toast(msg, err) {
+  function toast(msg, err, action) {
     clearTimeout(toastTimer);
-    $toast.innerHTML = `<div class="toast${err ? " err" : ""}">${esc(msg)}</div>`;
-    toastTimer = setTimeout(() => { $toast.innerHTML = ""; }, err ? 4500 : 2500);
+    $toast.innerHTML = `<div class="toast${err ? " err" : ""}${action ? " act" : ""}"><span>${esc(msg)}</span>${action ? `<button data-act="${action}">Undo</button>` : ""}</div>`;
+    toastTimer = setTimeout(() => { $toast.innerHTML = ""; }, err ? 4500 : action ? 6000 : 2500);
+  }
+  let lastAdded = null;   // the diary entry Undo removes
+  function addedToast(entry) {
+    lastAdded = entry.id;
+    toast(`Added ${entry.name} · ${fmtK(entry.kcal)} kcal`, false, "undoAdd");
   }
   async function busy(btn, fn) {
     if (btn) btn.disabled = true;
@@ -561,11 +835,19 @@
     },
     async signOut() { closeSheet(); await sb.auth.signOut(); setUser(null); },
 
+    // lists
+    sortBy: el => { S.sort = el.dataset.k === "used" ? "used" : "az"; pref.set("sort", S.sort); render(); },
+
     // diary
     addEntry: el => openAdd(el.dataset.meal),
-    pick: el => openAmount(el.dataset.kind, el.dataset.id, ctx.meal),
+    pick: el => pickItem(el.dataset.kind, el.dataset.id, ctx.meal),
     newFoodFromPick: () => openFood(null, { name: ctx.q.trim(), then: { meal: ctx.meal } }),
-    amtUnit: el => { ctx.unit = el.dataset.k; ctx.amount = ctx.unit === "g" ? 100 : 1; showSheet(amountHtml()); },
+    amtUnit: el => {
+      ctx.unit = el.dataset.k;
+      const last = lastLogged(ctx.id, ctx.unit);
+      ctx.amount = last ? +last.amount : ctx.unit === "g" ? 100 : 1;
+      showSheet(amountHtml());
+    },
     amtMeal: el => { ctx.meal = el.dataset.k; showSheet(amountHtml()); },
     saveEntry: el => busy(el, async () => {
       const amount = num(ctx.amount);
@@ -576,8 +858,33 @@
       const saved = await run(() => sb.from("ct_diary").insert(row).select().single());
       S.diary.push(saved);
       closeSheet(); render();
-      toast(`Added ${fmtK(n.kcal)} kcal`);
+      addedToast(saved);
     }),
+    undoAdd: el => busy(el, async () => {
+      const id = lastAdded;
+      if (!id) return;
+      lastAdded = null;
+      await run(() => sb.from("ct_diary").delete().eq("id", id));
+      S.diary = S.diary.filter(e => e.id !== id);
+      render(); toast("Removed");
+    }),
+
+    // barcode scanning
+    scan: el => openScan(el.dataset.from),
+    scanBack: () => {
+      const back = ctx && ctx.back;
+      stopScan();
+      if (!back) return closeSheet();
+      ctx = back;
+      showSheet(back.kind === "food" ? foodHtml() : pickHtml());
+    },
+    scanManual: () => {
+      const inp = document.getElementById("scanCode");
+      const code = normCode(inp ? inp.value : "");
+      if (!validCode(code)) { scanMsg("That doesn't look like a barcode — check the number under the lines."); return; }
+      stopScan();
+      findCode(code);
+    },
     editEntry: el => openEditEntry(el.dataset.id),
     entryMeal: el => { ctx.meal = el.dataset.k; showSheet(entryHtml()); },
     updateEntry: el => busy(el, async () => {
@@ -604,6 +911,14 @@
       if (num(ctx.basis) === basisOf(was)) ctx.basis = basisOf(ctx.unit);
       showSheet(foodHtml());
     },
+    fFixedMode: el => {
+      ctx.fixedOn = el.dataset.k === "fixed";
+      if (ctx.fixedOn && !(num(ctx.fixed) > 0) && ctx.unit === "item") ctx.fixed = 1;
+      showSheet(foodHtml());
+      const inp = document.getElementById("fFixed");
+      if (inp && !(num(ctx.fixed) > 0)) inp.focus();
+    },
+    fBarcodeClear: () => { ctx.barcode = ""; showSheet(foodHtml()); },
     saveFood: el => busy(el, async () => {
       const name = ctx.name.trim();
       if (!name) { toast("Give the food a name.", true); return; }
@@ -612,20 +927,31 @@
       if ([vals.protein, vals.carbs, vals.fat].some(v => v < 0)) { toast("Values can't be negative.", true); return; }
       const stored = toStored(ctx.unit, ctx.basis, vals);
       if (!stored) { toast("Enter the weight the values are for.", true); return; }
+      const fixed = ctx.fixedOn ? num(ctx.fixed) : null;
+      if (ctx.fixedOn && !(fixed > 0)) { toast("Enter the fixed amount, or choose each time.", true); return; }
+      const barcode = ctx.barcode || null;
+      const taken = barcode && S.foods.find(f => f.id !== ctx.id && f.barcode === barcode);
+      if (taken) { toast(`That barcode is already on “${taken.name}”.`, true); return; }
       const dup = S.foods.find(f => f.id !== ctx.id && f.name.trim().toLowerCase() === name.toLowerCase());
       if (dup && !window.confirm(`There's already a food called “${dup.name}”. Save another one anyway?`)) return;
-      const row = { name, unit: ctx.unit, ...stored, updated_at: new Date().toISOString() };
+      const row = { name, unit: ctx.unit, ...stored, fixed_amount: fixed, barcode, updated_at: new Date().toISOString() };
       let saved;
-      if (ctx.id) {
-        saved = await run(() => sb.from("ct_foods").update(row).eq("id", ctx.id).select().single());
-        S.foods = S.foods.map(f => (f.id === saved.id ? saved : f));
-      } else {
-        saved = await run(() => sb.from("ct_foods").insert({ ...row, user_id: S.user.id }).select().single());
-        S.foods.push(saved);
+      try {
+        if (ctx.id) {
+          saved = await run(() => sb.from("ct_foods").update(row).eq("id", ctx.id).select().single());
+          S.foods = S.foods.map(f => (f.id === saved.id ? saved : f));
+        } else {
+          saved = await run(() => sb.from("ct_foods").insert({ ...row, user_id: S.user.id }).select().single());
+          S.foods.push(saved);
+        }
+      } catch (e) {
+        // The other person linked this barcode to a food a moment ago.
+        if (e && e.code === "23505") { toast("That barcode is already on another food.", true); refreshShared(); return; }
+        throw e;
       }
       const then = ctx.then;
       closeSheet(); render();
-      if (then) openAmount("food", saved.id, then.meal);   // straight on to logging it
+      if (then) pickItem("food", saved.id, then.meal);   // straight on to logging it
       else toast("Saved");
     }),
     deleteFood: el => busy(el, async () => {
@@ -730,6 +1056,7 @@
     amt: el => { ctx.amount = el.value; document.getElementById("pv").innerHTML = nutPreview(amountNut(), "This adds"); },
     entryAmt: el => { ctx.amount = el.value; document.getElementById("pv").innerHTML = nutPreview(entryNut(), "Now"); },
     fName: el => { ctx.name = el.value; },
+    fFixed: el => { ctx.fixed = el.value; },
     fBasis: el => { ctx.basis = el.value; refreshFoodPreview(); },
     fVal: el => { ctx.vals[el.dataset.k] = el.value; refreshFoodPreview(); },
     dName: el => { ctx.name = el.value; },
@@ -764,7 +1091,9 @@
     if (el && LIVE[el.dataset.live]) LIVE[el.dataset.live](el, ev);
   });
   document.addEventListener("keydown", ev => {
-    if (ev.key === "Enter" && ev.target && ev.target.id === "pw") A.signIn(document.querySelector("[data-act=signIn]"));
+    if (ev.key !== "Enter" || !ev.target) return;
+    if (ev.target.id === "pw") A.signIn(document.querySelector("[data-act=signIn]"));
+    if (ev.target.id === "scanCode") A.scanManual();
   });
 
   // ── Start ─────────────────────────────────────────────────────────────────
@@ -793,7 +1122,9 @@
   let lastToday = isoDay();
   let hiddenAt = 0;
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) { hiddenAt = Date.now(); return; }
+    // The camera stops while the app is in the background, and starts again on return.
+    if (document.hidden) { hiddenAt = Date.now(); stopScan(); return; }
+    if (ctx && ctx.kind === "scan") startScan();
     const t = isoDay();
     if (t !== lastToday) { if (S.day === lastToday) S.day = t; lastToday = t; if (S.user && !ctx) render(); }
     if (S.user && !S.loading && !ctx && hiddenAt && Date.now() - hiddenAt > 60 * 1000) refreshShared();

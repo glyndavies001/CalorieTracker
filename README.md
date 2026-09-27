@@ -3,19 +3,31 @@
 A small installable web app for tracking calories, protein, carbs, fat and body weight.
 
 - **Today** – a diary by meal, with totals against daily targets
-- **Foods** – values typed straight from the label (per 100 g, per serving or per item)
+- **Foods** – values typed straight from the label (per 100 g, per serving or per item), or filled in by scanning the barcode
 - **Dishes** – recipes built from the foods list; totals per portion or per cooked weight, updated whenever a food changes
 - **Weight** – daily weigh-ins in kg or stones and pounds, with a trend chart and goal
+
+Handy details:
+
+- **Barcode scanning** – scan when adding to the diary or on the Foods tab. The household's foods are checked
+  first, then [Open Food Facts](https://world.openfoodfacts.org) (a free, open product database); a found product
+  opens pre-filled to check and save. The barcode is kept on the food, so the next scan finds it straight away.
+  Phones with a built-in barcode reader (Android) use it; others (iPhone) use ZXing, downloaded on first use.
+- **Fixed portions** – a food can have a set amount (e.g. one pack of noodles); tapping it adds it in one go, with Undo.
+- **Remembered amounts** – adding a food or dish starts at the amount you last logged for it.
+- **Sorting** – Foods and Dishes can be sorted A–Z or by how often you log them (remembered on each device).
 
 ## How it's built
 
 Plain HTML and JavaScript with no build step: `index.html`, `app.js`, `sw.js` (network-first
-service worker), `manifest.json`, the icons, and `vendor/supabase.js` (Supabase JS 2.49.4).
+service worker), `manifest.json`, the icons, `vendor/supabase.js` (Supabase JS 2.49.4) and
+`vendor/zxing.min.js` (@zxing/library 0.23.0, Apache-2.0, only loaded when scanning).
 
 Data lives in the same Supabase project as Vaulted, in the `ct_foods`, `ct_dishes`, `ct_diary`,
 `ct_weights` and `ct_settings` tables; sign in with an existing Vaulted login. Foods and dishes
 are one list shared by the household (either account can add, edit or delete); the diary,
-weights and settings are private to each account (row-level security).
+weights and settings are private to each account (row-level security). A barcode can belong
+to only one food.
 
 Diary entries store the calories and macros as they were when logged, so editing a food later
 doesn't change past days.
