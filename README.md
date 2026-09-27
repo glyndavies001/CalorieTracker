@@ -2,7 +2,9 @@
 
 A small installable web app for tracking calories, protein, carbs, fat and body weight.
 
-- **Today** – a diary by meal, with totals against daily targets
+- **Today** – a diary by meal, with totals against daily targets; switch to **Month** for a chart of each
+  day's calories against the target (over-target days in red), the month's averages, days under/over and
+  the weight change, with a tap on any day to open it
 - **Foods** – values typed straight from the label (per 100 g, per serving or per item), or filled in by scanning the barcode
 - **Dishes** – recipes built from the foods list; totals per portion or per cooked weight, updated whenever a food changes
 - **Weight** – daily weigh-ins in kg or stones and pounds, with a trend chart and goal

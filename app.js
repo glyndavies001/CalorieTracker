@@ -6,7 +6,7 @@
 (function () {
   "use strict";
 
-  const APP_VERSION = "1.2.0";
+  const APP_VERSION = "1.3.0";
   const SUPABASE_URL = "https://yfbarahnwcrwewtpithb.supabase.co";
   const SUPABASE_KEY = "sb_publishable_ItUAbr04KIijWuO-JWgDNg_J5YCwaqK";
   const DIARY_DAYS = 120;   // diary history loaded up front; older days load when opened
@@ -85,6 +85,28 @@
     return parseIso(iso).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
   }
   const longDate = iso => parseIso(iso).toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+  const shortDate = iso => parseIso(iso).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
+  // Months as "YYYY-MM".
+  const daysIn = ym => { const [y, m] = ym.split("-").map(Number); return new Date(y, m, 0).getDate(); };
+  const addMonths = (ym, n) => { const [y, m] = ym.split("-").map(Number); const d = new Date(y, m - 1 + n, 1); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`; };
+  const monthLabel = ym => { const [y, m] = ym.split("-").map(Number); return new Date(y, m - 1, 1).toLocaleDateString("en-GB", { month: "long", year: "numeric" }); };
+
+  // Every day of a month with its totals, and averages over the finished days that were logged
+  // (today is still going, and a day with nothing logged would only drag the average down).
+  function monthStats(diary, ym, target, today) {
+    const byDay = new Map();
+    for (const e of diary) if (e.day && e.day.slice(0, 7) === ym) { const l = byDay.get(e.day); if (l) l.push(e); else byDay.set(e.day, [e]); }
+    const days = [];
+    for (let d = 1; d <= daysIn(ym); d++) {
+      const iso = `${ym}-${String(d).padStart(2, "0")}`;
+      const list = byDay.get(iso) || [];
+      days.push({ day: iso, n: list.length, ...sumN(list), today: iso === today, future: iso > today });
+    }
+    const done = days.filter(x => x.n && x.day < today);
+    const under = target ? done.filter(x => Math.round(x.kcal) <= target).length : 0;
+    return { days, done: done.length, logged: days.filter(x => x.n).length,
+      avg: done.length ? scaleN(sumN(done), 1 / done.length) : null, under, over: target ? done.length - under : 0 };
+  }
 
   // ── Formatting ─────────────────────────────────────────────────────────────
   const fmtK = n => Math.round(+n || 0).toLocaleString("en-GB");
@@ -131,7 +153,8 @@
   }
 
   // Exposed for tests.
-  window.CT = { zero, addN, scaleN, sumN, basisOf, foodFor, toStored, dishTotals, dishFor, kgToStLb, stLbToKg, fmtWeight, fmtDelta, isoDay, addDays, dayLabel, esc, normCode, validCode, offToFood, APP_VERSION };
+  window.CT = { zero, addN, scaleN, sumN, basisOf, foodFor, toStored, dishTotals, dishFor, kgToStLb, stLbToKg, fmtWeight, fmtDelta, isoDay, addDays, dayLabel, esc, normCode, validCode, offToFood,
+    daysIn, addMonths, monthStats, APP_VERSION };
 
   // Small per-device preferences, such as list order. Storage can be unavailable, so nothing depends on it.
   const pref = {
@@ -141,7 +164,8 @@
 
   // ── State ─────────────────────────────────────────────────────────────────
   const S = { user: null, loading: true, view: "today", day: isoDay(), foods: [], dishes: [], diary: [], diaryFrom: null, weights: [], settings: {}, foodQuery: "",
-    sort: pref.get("sort", "az") === "used" ? "used" : "az" };
+    sort: pref.get("sort", "az") === "used" ? "used" : "az",
+    mode: "day", month: isoDay().slice(0, 7), mSel: null, mLoading: false };   // Today tab: one day, or a month at a time
   const foodsById = () => Object.fromEntries(S.foods.map(f => [f.id, f]));
   let sb = null;
   let ctx = null;   // what the open sheet is doing
@@ -149,6 +173,22 @@
   const $app = document.getElementById("app");
   const $sheet = document.getElementById("sheet");
   const $toast = document.getElementById("toast");
+
+  // The on-screen keyboard covers the bottom of the screen without resizing the page,
+  // so sheets and toasts follow the part that's still visible (see .veil and .toast).
+  (function followKeyboard() {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const css = document.documentElement.style;
+    const fit = () => {
+      css.setProperty("--vv-top", vv.offsetTop + "px");
+      css.setProperty("--vv-h", vv.height + "px");
+      css.setProperty("--kb", Math.max(0, window.innerHeight - vv.height - vv.offsetTop) + "px");
+    };
+    vv.addEventListener("resize", fit);
+    vv.addEventListener("scroll", fit);
+    fit();
+  })();
 
   // ── Data ──────────────────────────────────────────────────────────────────
   const isNet = e => /failed to fetch|networkerror|load failed|network request failed/i.test((e && (e.message || String(e))) || "");
@@ -182,6 +222,22 @@
     if (S.diaryFrom && day >= S.diaryFrom) return;
     const rows = await run(() => sb.from("ct_diary").select("*").eq("day", day).order("created_at"));
     S.diary = S.diary.filter(e => e.day !== day).concat(rows || []);
+  }
+  const loadedMonths = new Set();
+  async function ensureMonth(ym) {
+    const from = ym + "-01", to = `${ym}-${String(daysIn(ym)).padStart(2, "0")}`;
+    if ((S.diaryFrom && from >= S.diaryFrom) || loadedMonths.has(ym)) return;
+    const rows = await run(() => sb.from("ct_diary").select("*").gte("day", from).lte("day", to).order("created_at"));
+    S.diary = S.diary.filter(e => e.day < from || e.day > to).concat(rows || []);
+    loadedMonths.add(ym);
+  }
+  // Month view: older months load when opened; the view stays up, faded, meanwhile.
+  async function loadMonth() {
+    const ym = S.month;
+    if ((S.diaryFrom && ym + "-01" >= S.diaryFrom) || loadedMonths.has(ym)) return;
+    S.mLoading = true; render();
+    try { await ensureMonth(ym); }
+    finally { S.mLoading = false; if (S.month === ym && S.view === "today") render(); }
   }
 
   // ── Rendering ─────────────────────────────────────────────────────────────
@@ -218,14 +274,16 @@
       <div class="bar"><div style="width:${w}%;background:${color}"></div></div></div>`;
   }
 
+  const modeBar = () => `<div class="sortbar">${segHtml([["day", "Day"], ["month", "Month"]], S.mode, "mode")}</div>`;
   function viewToday() {
+    if (S.mode === "month") return modeBar() + viewMonth();
     const entries = S.diary.filter(e => e.day === S.day);
     const tot = sumN(entries);
     const eaten = Math.round(tot.kcal);   // round once, so eaten + left always adds up to the target
     const target = +S.settings.kcal_target || 0;
     const over = target > 0 && eaten > target;
     const pct = target ? Math.min(100, (tot.kcal / target) * 100) : 0;
-    let html = `<div class="daynav">
+    let html = modeBar() + `<div class="daynav">
       <button data-act="day" data-n="-1" aria-label="Previous day">‹</button>
       <div class="when" data-act="goToday"><div class="big">${esc(dayLabel(S.day))}</div><div class="tiny dim">${esc(longDate(S.day))}</div></div>
       <button data-act="day" data-n="1" aria-label="Next day">›</button></div>`;
@@ -253,6 +311,111 @@
       </div>`;
     }
     return html;
+  }
+
+  // ── Month: calories each day against the target, and the month's averages ──
+  // Over/under always has an arrow and words as well as colour.
+  function vsTarget(kcal, target) {
+    const d = Math.round(kcal) - target;
+    if (d === 0) return `<span class="muted">on target</span>`;
+    return d > 0 ? `<span class="up">▲ ${fmtK(d)} over</span>` : `<span class="down">▼ ${fmtK(-d)} under</span>`;
+  }
+  function viewMonth() {
+    const target = +S.settings.kcal_target || 0;
+    const today = isoDay();
+    const st = monthStats(S.diary, S.month, target, today);
+    const dim = S.mLoading ? ' style="opacity:.5"' : "";
+    const last = S.month >= today.slice(0, 7);
+    let html = `<div class="daynav">
+      <button data-act="month" data-n="-1" aria-label="Previous month">‹</button>
+      <div class="when"><div class="big">${esc(monthLabel(S.month))}</div><div class="tiny dim">${S.mLoading ? "Loading…" : st.logged ? `${st.logged} day${st.logged === 1 ? "" : "s"} logged` : "Nothing logged"}</div></div>
+      <button data-act="month" data-n="1" aria-label="Next month"${last ? ' disabled style="opacity:.3"' : ""}>›</button></div>`;
+
+    const a = st.avg;
+    html += `<div class="card"${dim}>`;
+    if (!a) html += `<div class="small muted">${st.logged ? "Averages start once a day is finished — today is still going." : "Nothing logged this month."}</div>`;
+    else {
+      html += `<div class="row" style="align-items:flex-end">
+          <div class="grow"><div class="label">Average day</div><div class="ring-num">${fmtK(a.kcal)} <span class="small dim" style="font-weight:600">kcal</span></div></div>
+          ${target ? `<div style="text-align:right"><div class="label">Target ${fmtK(target)}</div><div style="font-size:15px;font-weight:800;margin-top:4px">${vsTarget(a.kcal, target)}</div></div>`
+                   : `<button class="btn ghost" data-act="settings" style="padding:8px 10px;font-size:12px">Set daily targets</button>`}</div>`;
+      if (target) html += `<div class="grid3" style="margin-top:12px">
+          <div class="mstat"><div class="label">Days</div><div class="v">${st.done}</div></div>
+          <div class="mstat"><div class="label">Under</div><div class="v down">▼ ${st.under}</div></div>
+          <div class="mstat"><div class="label">Over</div><div class="v up">▲ ${st.over}</div></div></div>`;
+      html += macroBar(a, "protein", "Protein", "p", "var(--protein)") + macroBar(a, "carbs", "Carbs", "c", "var(--carbs)") + macroBar(a, "fat", "Fat", "f", "var(--fat)");
+    }
+    const unit = S.settings.weight_unit || "kg";
+    const ws = S.weights.filter(w => w.day.slice(0, 7) === S.month).sort((x, y) => (x.day < y.day ? -1 : x.day > y.day ? 1 : 0));
+    if (ws.length > 1) {
+      const w0 = ws[0], w1 = ws[ws.length - 1];
+      html += `<div class="row small" style="margin-top:12px;align-items:flex-start"><span class="grow muted">Weight</span>
+        <div style="text-align:right"><b style="color:var(--soft)">${fmtDelta(w1.kg - w0.kg, unit)}</b>
+          <div class="tiny faint">${esc(fmtWeight(w0.kg, unit))} → ${esc(fmtWeight(w1.kg, unit))}</div></div></div>`;
+    }
+    html += `</div>`;
+
+    if (st.logged) {
+      html += `<div class="card"${dim}><div class="label">Calories each day</div>${monthChartSvg(st, target)}
+        ${target ? `<div class="mkey"><span><i style="background:var(--green)"></i>Under target</span><span><i style="background:var(--red)"></i>Over</span><span><i class="line"></i>Target</span></div>` : ""}
+        <div class="mread">${monthReadout(st, target)}</div></div>`;
+      // The same numbers as a list — tap a day to open it.
+      html += `<div class="list"${dim}>${st.days.filter(d => d.n).reverse().map(d => `<div class="item tap" data-act="openDay" data-day="${d.day}">
+          <div class="grow"><div class="name">${esc(dayLabel(d.day))}</div><div class="sub">${d.n} item${d.n === 1 ? "" : "s"}${d.today ? " · so far" : ""}</div></div>
+          <div style="text-align:right"><div class="kcal">${fmtK(d.kcal)}</div>${target && !d.today ? `<div class="tiny">${vsTarget(d.kcal, target)}</div>` : ""}</div></div>`).join("")}</div>`;
+    }
+    return html;
+  }
+  function monthReadout(st, target) {
+    const d = S.mSel && st.days.find(x => x.day === S.mSel);
+    if (!d) return `<div class="tiny faint" style="text-align:center;padding-top:10px">Tap a day to see it</div>`;
+    return `<div class="row"><div class="grow"><b>${esc(shortDate(d.day))}</b>${d.today ? " (so far)" : ""} · ${d.n ? `${fmtK(d.kcal)} kcal${target && !d.today ? " · " + vsTarget(d.kcal, target) : ""}` : `<span class="muted">nothing logged</span>`}</div>
+      <button class="btn ghost sm" data-act="openDay" data-day="${d.day}">Open ›</button></div>`;
+  }
+  // Columns grow from one baseline, 4px rounded tops; above the target the excess is red,
+  // split from the green by a 2px gap on the dashed target line. Today (unfinished) is faded.
+  function monthChartSvg(st, target) {
+    const W = 320, H = 170, L = 32, R = 4, T = 12, B = 20;
+    const pw = W - L - R, ph = H - T - B, base = T + ph;
+    const days = st.days, n = days.length;
+    const hi = Math.max(target, 500, ...days.map(d => d.kcal));
+    const raw = hi / 5, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const step = [1, 2, 2.5, 5, 10].map(k => k * mag).find(s => s >= raw);
+    const top = Math.ceil((hi * 1.04) / step) * step;
+    const Y = v => T + ph - (v / top) * ph;
+    const slot = pw / n, bw = Math.min(24, Math.max(2, slot - 2)), r = Math.min(4, bw / 2);
+    const f = v => (Math.round(v * 10) / 10).toString();
+    const col = (x, y0, y1, fill) => {
+      const h = y0 - y1;
+      if (h < 0.5) return "";
+      const rr = Math.min(r, h);
+      return `<path d="M${f(x)} ${f(y0)}V${f(y1 + rr)}A${f(rr)} ${f(rr)} 0 0 1 ${f(x + rr)} ${f(y1)}H${f(x + bw - rr)}A${f(rr)} ${f(rr)} 0 0 1 ${f(x + bw)} ${f(y1 + rr)}V${f(y0)}Z" fill="${fill}"/>`;
+    };
+    let svg = "";
+    for (let v = 0; v <= top + 0.001; v += step) {
+      svg += `<line x1="${L}" x2="${W - R}" y1="${f(Y(v))}" y2="${f(Y(v))}" stroke="#1e2535" stroke-width="1"/>`
+        + `<text x="${L - 5}" y="${f(Y(v) + 3)}" fill="#5a6480" font-size="9" text-anchor="end">${fmtK(v)}</text>`;
+    }
+    days.forEach((d, i) => {
+      if (d.day === S.mSel) svg += `<rect x="${f(L + i * slot)}" y="${T}" width="${f(slot)}" height="${ph}" fill="#ffffff" opacity=".08"/>`;
+    });
+    days.forEach((d, i) => {
+      if (!d.n || !(d.kcal > 0)) return;
+      const x = L + i * slot + (slot - bw) / 2;
+      let g;
+      if (!target) g = col(x, base, Y(d.kcal), "#4a9eff");
+      else if (Math.round(d.kcal) <= target) g = col(x, base, Y(d.kcal), "#00c88c");
+      else g = `<rect x="${f(x)}" y="${f(Y(target) + 1)}" width="${f(bw)}" height="${f(Math.max(0, base - Y(target) - 1))}" fill="#00c88c"/>` + col(x, Y(target) - 1, Y(d.kcal), "#ff4a6a");
+      svg += d.today ? `<g opacity=".45">${g}</g>` : g;
+    });
+    if (target) svg += `<line x1="${L}" x2="${W - R}" y1="${f(Y(target))}" y2="${f(Y(target))}" stroke="#8892b0" stroke-width="1" stroke-dasharray="3 3"/>`;
+    for (const d of [1, 8, 15, 22, 29]) if (d <= n) svg += `<text x="${f(L + (d - 0.5) * slot)}" y="${H - 5}" fill="#5a6480" font-size="9" text-anchor="middle">${d}</text>`;
+    days.forEach((d, i) => {   // tap targets: the whole column, not just the bar
+      if (d.future) return;
+      const label = `${shortDate(d.day)}: ${d.n ? fmtK(d.kcal) + " kcal" : "nothing logged"}`;
+      svg += `<rect x="${f(L + i * slot)}" y="${T}" width="${f(slot)}" height="${ph + B}" fill="transparent" data-act="mSel" data-day="${d.day}" tabindex="0" role="button" aria-label="${esc(label)}"/>`;
+    });
+    return `<svg class="mchart" viewBox="0 0 ${W} ${H}" role="group" aria-label="Calories each day">${svg}</svg>`;
   }
 
   // A–Z, or most used first: how often you've logged each one (your own diary).
@@ -814,6 +977,25 @@
     settings: () => openSettings(),
     goToday: () => { S.day = isoDay(); render(); },
     day: el => busy(null, async () => { S.day = addDays(S.day, +el.dataset.n); render(); await ensureDay(S.day); render(); }),
+    mode: el => busy(null, async () => {
+      S.mode = el.dataset.k === "month" ? "month" : "day";
+      if (S.mode === "month") { S.month = S.day.slice(0, 7); S.mSel = null; }
+      render();
+      if (S.mode === "month") await loadMonth();
+    }),
+    month: el => busy(null, async () => {
+      const next = addMonths(S.month, +el.dataset.n);
+      if (next > isoDay().slice(0, 7)) return;
+      S.month = next; S.mSel = null;
+      render();
+      await loadMonth();
+    }),
+    mSel: el => { S.mSel = S.mSel === el.dataset.day ? null : el.dataset.day; render(); },
+    openDay: el => busy(null, async () => {
+      S.day = el.dataset.day; S.mode = "day";
+      render(); window.scrollTo(0, 0);
+      await ensureDay(S.day); render();
+    }),
 
     async signIn(el) {
       const email = document.getElementById("email").value.trim();
@@ -1091,9 +1273,13 @@
     if (el && LIVE[el.dataset.live]) LIVE[el.dataset.live](el, ev);
   });
   document.addEventListener("keydown", ev => {
-    if (ev.key !== "Enter" || !ev.target) return;
-    if (ev.target.id === "pw") A.signIn(document.querySelector("[data-act=signIn]"));
-    if (ev.target.id === "scanCode") A.scanManual();
+    const t = ev.target;
+    if (!t || !t.getAttribute) return;
+    // chart columns are role="button": Enter or Space picks them, as a click would
+    if ((ev.key === "Enter" || ev.key === " ") && t.getAttribute("role") === "button" && A[t.getAttribute("data-act")]) { ev.preventDefault(); A[t.getAttribute("data-act")](t, ev); return; }
+    if (ev.key !== "Enter") return;
+    if (t.id === "pw") A.signIn(document.querySelector("[data-act=signIn]"));
+    if (t.id === "scanCode") A.scanManual();
   });
 
   // ── Start ─────────────────────────────────────────────────────────────────
