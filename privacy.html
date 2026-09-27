@@ -29,16 +29,17 @@
   <ul>
     <li>Your food diary, body weight, daily targets and settings. These are private to your account.</li>
     <li>The foods and dishes list, which is shared by the household.</li>
-    <li>If you connect a Fitbit: the total calories you burned and the steps you took each day (see below).</li>
+    <li>If you connect a Fitbit: the total calories you burned and the steps you took each day (see below).
+      Sleep and heart rate, if you allow them, are shown in the app but not stored.</li>
     <li>If you turn on the step reminder: a notification address for that phone (see below).</li>
   </ul>
   <p>Everything is kept in a hosted database (Supabase) behind your login.</p>
 
   <h2>Google (Fitbit) data</h2>
   <p>Only if you choose <b>Connect</b>, CalorieTracker asks Google for read-only access to your activity and fitness data
-    through the Google Health API. It reads two things: the total calories you burned each day and your steps each day.
-    These are used only to show calories burned, your deficit or surplus and your steps inside the app, and — if you turn
-    it on — to send you the evening step reminder.</p>
+    through the Google Health API. It reads the total calories you burned and your steps each day (and your steps minute
+    by minute for the live step count), and — only if you allow them — your sleep and your heart rate. These are used only
+    to show them to you inside the app and, if you turn it on, to send you the evening step reminder.</p>
   <ul>
     <li>It is stored with your private diary and shown only to you — not to the other person in the household.</li>
     <li>It is fetched when you open the app and, if the step reminder is on, once in the evening to check your steps.</li>

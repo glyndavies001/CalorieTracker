@@ -1,10 +1,13 @@
 // @ts-nocheck
-// CalorieTracker ⇄ Google Health API (Fitbit): calories burned and steps each day,
-// plus the evening step reminder.
+// CalorieTracker ⇄ Google Health API (Fitbit): calories burned and steps each day, live steps,
+// sleep and heart rate, plus the evening step reminder.
 //
 // POST {action:"start"}                → the Google sign-in URL for the caller
 // GET  ?code=…&state=…                 → Google sends the person back here after signing in
 // POST {action:"sync", today, from}    → fetch calories burned and steps for those days into ct_burn
+// POST {action:"live"}                 → today's steps, the last half hour minute by minute, when the watch last synced
+// POST {action:"sleep", days}          → sleep sessions (with stages) ending in the last `days` days
+// POST {action:"heart", resting}       → today's heart rate in 5-minute steps (+ 30 days of resting heart rate)
 // POST {action:"disconnect"}           → forget the link (and revoke it at Google)
 // POST {action:"push_key"}             → the public key phones subscribe with
 // POST {action:"push_test"}            → a test notification to the caller's phones
@@ -17,7 +20,10 @@
 import { sendPush, makeVapidKeys } from "./webpush.ts";
 
 export const APP_URL = "https://calorie-tracker-roan-three.vercel.app";
-const SCOPE = "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly";
+const GH = "https://www.googleapis.com/auth/googlehealth.";
+const SCOPE = GH + "activity_and_fitness.readonly";   // required: calories burned and steps
+const EXTRA = { sleep: GH + "sleep.readonly", heart: GH + "health_metrics_and_measurements.readonly" };   // optional
+const HB = "https://health.googleapis.com/v4/users/me/dataTypes";
 const GOOGLE_AUTH = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN = "https://oauth2.googleapis.com/token";
 const GOOGLE_REVOKE = "https://oauth2.googleapis.com/revoke";
@@ -58,7 +64,7 @@ async function db(method, path, body, prefer) {
 const upsert = (table, rows, onConflict) => db("POST", `${table}?on_conflict=${onConflict}`, rows, "resolution=merge-duplicates,return=minimal");
 async function getLink(userId) { const rows = await db("GET", `ct_fit_links?user_id=eq.${userId}&select=*`); return rows && rows[0]; }
 const patchLink = (userId, patch) => db("PATCH", `ct_fit_links?user_id=eq.${userId}`, patch, "return=minimal");
-const setStatus = (userId, fit_status) => upsert("ct_settings", [{ user_id: userId, fit_status }], "user_id");
+const setStatus = (userId, fit_status, extra = {}) => upsert("ct_settings", [{ user_id: userId, fit_status, ...extra }], "user_id");
 
 async function config() {
   const rows = await db("GET", "ct_config?select=key,value&key=in.(google_client_id,google_client_secret,vapid_public,vapid_private,cron_key)");
@@ -131,7 +137,7 @@ export async function fetchDaily(token, type, from, today) {
   });
   if (res.status === 401) return { expired: true };
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`health ${type} ${res.status}: ${(data.error && data.error.message) || ""}`.trim());
+  if (!res.ok) throw Object.assign(new Error(`health ${type} ${res.status}: ${(data.error && data.error.message) || ""}`.trim()), { status: res.status });
   const days = new Map();
   for (const p of data.rollupDataPoints || []) {
     const day = isoOf(p.civilStartTime);
@@ -167,7 +173,182 @@ async function sync(userId, from, today, cfg) {
   if (cal.days.size) await upsert("ct_burn", rows("kcal", cal.days), "user_id,day");
   if (steps.days.size) await upsert("ct_burn", rows("steps", steps.days), "user_id,day");
   await patchLink(userId, { last_sync_at: new Date().toISOString(), last_error: null });
-  return stepsError ? { linked: true, days, stepsError } : { linked: true, days };
+  const syncedAt = await noteSynced(userId, token);
+  const out = { linked: true, days, syncedAt };
+  if (stepsError) out.stepsError = true;
+  return out;
+}
+
+// ── Reading Google's data points ─────────────────────────────────────────────
+// One GET/POST to the Google Health API; errors carry the HTTP status (401 = token, 403 = permission).
+async function gcall(token, url, body) {
+  const res = await fetch(url, {
+    method: body ? "POST" : "GET",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw Object.assign(new Error(`health ${res.status}: ${(data.error && data.error.message) || ""}`.trim()), { status: res.status, bad: res.status === 400 });
+  return data;
+}
+// All data points matching a filter, following pages. Some filter field names are spelt
+// either way (activity_level / activityLevel): each is tried until one is accepted.
+const filterSpelling = {};   // data type -> index of the spelling Google accepted
+async function listPoints(token, type, filters, pageSize = 1000, maxPages = 10) {
+  const tries = filterSpelling[type] != null && filters[filterSpelling[type]] ? [filterSpelling[type]] : filters.map((_, i) => i);
+  let lastErr;
+  for (const i of tries) {
+    const f = filters[i];
+    try {
+      const out = [];
+      let pageToken = "", pages = 0;
+      do {
+        const q = new URLSearchParams({ filter: f, pageSize: String(pageSize) });
+        if (pageToken) q.set("pageToken", pageToken);
+        const data = await gcall(token, `${HB}/${type}/dataPoints?${q}`);
+        out.push(...(data.dataPoints || []));
+        pageToken = data.nextPageToken || "";
+        pages++;
+      } while (pageToken && pages < maxPages);
+      filterSpelling[type] = i;
+      return out;
+    } catch (e) { lastErr = e; if (!e.bad) throw e; }
+  }
+  throw lastErr;
+}
+const both = (snake, camel, rest) => [`${snake}${rest}`, `${camel}${rest}`];
+const ms = iso => new Date(iso).getTime();
+const minutesAgo = n => new Date(Date.now() - n * 60000).toISOString().replace(/\.\d{3}Z$/, "Z");
+// When the watch last sent data: the latest minute of activity level Google has
+// (it's recorded every minute the watch is worn, moving or not).
+export async function watchSyncedAt(token) {
+  for (const back of [30, 6 * 60]) {
+    const pts = await listPoints(token, "activity-level", both("activity_level", "activityLevel", `.interval.start_time >= "${minutesAgo(back)}"`), 1000, 2);
+    let latest = null;
+    for (const p of pts) {
+      const v = p.activityLevel || Object.values(p).find(x => x && typeof x === "object" && x.interval);
+      const iv = v && v.interval;
+      if (iv && iv.endTime && (!latest || ms(iv.endTime) > ms(latest))) latest = iv.endTime;
+    }
+    if (latest) return new Date(latest).toISOString();
+  }
+  return null;
+}
+// Keeps ct_settings.fit_synced_at current (the app shows it); never fatal.
+async function noteSynced(userId, token) {
+  try {
+    const at = await watchSyncedAt(token);
+    if (at) await upsert("ct_settings", [{ user_id: userId, fit_synced_at: at }], "user_id");
+    return at;
+  } catch (e) { console.error("synced", e); return null; }
+}
+// Runs fn(token) for a linked person: one retry with a fresh token on 401; a missing
+// permission comes back as {needScope}.
+async function withGoogle(userId, cfg, need, fn) {
+  const link = await getLink(userId);
+  if (!link || !link.refresh_token) return { linked: false };
+  if (link.status === "reauth") return { linked: true, reconnect: true };
+  if (need && !String(link.scope || "").split(" ").includes(EXTRA[need])) return { linked: true, needScope: need };
+  const runOnce = async fresh => {
+    const token = await accessToken(fresh ? { ...link, access_token: null } : link, cfg);
+    if (!token) return null;
+    return await fn(token);
+  };
+  try {
+    let r = await runOnce(false);
+    if (r === null) r = await runOnce(true);
+    if (r !== null) return { linked: true, ...r };
+  } catch (e) {
+    if (e.status === 403 && need) return { linked: true, needScope: need };
+    if (e.status !== 401) throw e;
+    try { const r = await runOnce(true); if (r !== null) return { linked: true, ...r }; }
+    catch (e2) { if (e2.status !== 401) throw e2; }
+  }
+  await patchLink(userId, { status: "reauth", last_error: "link expired" });
+  await setStatus(userId, "reauth");
+  return { linked: true, reconnect: true };
+}
+
+// ── Live steps: today's total, the last half hour minute by minute, the watch's last sync ──
+export async function live(userId, cfg) {
+  return await withGoogle(userId, cfg, null, async token => {
+    const today = ukNow().day;
+    const d = await fetchDaily(token, "steps", today, today);
+    if (d.expired) throw Object.assign(new Error("expired"), { status: 401 });
+    const steps = d.days.has(today) ? d.days.get(today) : 0;
+    const pts = await listPoints(token, "steps", [`steps.interval.start_time >= "${minutesAgo(30)}"`], 100, 1);
+    const minutes = pts.map(p => p.steps && p.steps.interval && { t: new Date(p.steps.interval.endTime).toISOString(), n: parseInt(p.steps.count, 10) || 0 })
+      .filter(Boolean).sort((a, b) => ms(a.t) - ms(b.t));
+    const syncedAt = await noteSynced(userId, token);
+    await upsert("ct_burn", [{ user_id: userId, day: today, steps, source: "google", updated_at: new Date().toISOString() }], "user_id,day");
+    return { today, steps, minutes, syncedAt };
+  });
+}
+
+// ── Sleep: sessions ending in the last `days` days, stages as [type, start min, minutes] ──
+const STAGE = { AWAKE: "awake", REM: "rem", LIGHT: "light", DEEP: "deep", ASLEEP: "asleep", RESTLESS: "restless" };
+const mins = v => Math.round(+v || 0);
+export async function sleep(userId, cfg, days) {
+  return await withGoogle(userId, cfg, "sleep", async token => {
+    const since = addDays(ukNow().day, -Math.max(1, Math.min(60, days || 30)));
+    const pts = await listPoints(token, "sleep", [`sleep.interval.civil_end_time >= "${since}"`, `sleep.interval.end_time >= "${since}T00:00:00Z"`], 25, 6);
+    const sessions = [];
+    for (const p of pts) {
+      const s = p.sleep;
+      if (!s || !s.interval || !s.interval.startTime || !s.interval.endTime) continue;
+      const t0 = ms(s.interval.startTime), t1 = ms(s.interval.endTime);
+      const stages = (s.stages || []).filter(x => x.startTime && x.endTime && STAGE[x.type])
+        .map(x => [STAGE[x.type], Math.round((ms(x.startTime) - t0) / 60000), Math.max(0, Math.round((ms(x.endTime) - ms(x.startTime)) / 60000))]);
+      const sum = s.summary || {};
+      const byStage = {};
+      for (const st of stages) byStage[st[0]] = (byStage[st[0]] || 0) + st[2];
+      const meta = s.metadata || {};
+      sessions.push({
+        start: new Date(t0).toISOString(), end: new Date(t1).toISOString(),
+        offset: s.interval.endUtcOffset || s.interval.startUtcOffset || null,
+        type: s.type === "CLASSIC" ? "classic" : "stages",
+        nap: !!(meta.nap || meta.isNap || meta.napSession),
+        asleep: sum.minutesAsleep != null ? mins(sum.minutesAsleep) : Object.entries(byStage).filter(([k]) => k !== "awake" && k !== "restless").reduce((a, [, v]) => a + v, 0),
+        awake: sum.minutesAwake != null ? mins(sum.minutesAwake) : (byStage.awake || 0),
+        byStage, stages,
+      });
+    }
+    sessions.sort((a, b) => ms(a.end) - ms(b.end));
+    return { sessions };
+  });
+}
+
+// ── Heart rate: today in 5-minute steps (avg/min/max) and resting heart rate by day ──
+// Midnight today in the UK, as an instant.
+function ukMidnight(day) {
+  const [y, m, d] = day.split("-").map(Number);
+  const noon = new Date(Date.UTC(y, m - 1, d, 12));
+  const ukHour = +new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", hourCycle: "h23" }).format(noon);
+  return new Date(Date.UTC(y, m - 1, d) - (ukHour - 12) * 3600000);
+}
+export async function heart(userId, cfg, withResting) {
+  return await withGoogle(userId, cfg, "heart", async token => {
+    const today = ukNow().day;
+    const start = ukMidnight(today).toISOString().replace(/\.\d{3}Z$/, "Z");
+    const end = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+    const roll = await gcall(token, `${HB}/heart-rate/dataPoints:rollUp`, { range: { startTime: start, endTime: end }, windowSize: "300s", pageSize: 400 });
+    const day = [];
+    for (const p of roll.rollupDataPoints || []) {
+      const v = p.heartRate || p.heartRateRollupValue || Object.values(p).find(x => x && typeof x === "object" && "beatsPerMinuteAvg" in x);
+      if (!v || v.beatsPerMinuteAvg == null || !p.startTime) continue;
+      day.push({ t: new Date(p.startTime).toISOString(), avg: Math.round(+v.beatsPerMinuteAvg), min: Math.round(+(v.beatsPerMinuteMin ?? v.beatsPerMinuteAvg)), max: Math.round(+(v.beatsPerMinuteMax ?? v.beatsPerMinuteAvg)) });
+    }
+    day.sort((a, b) => ms(a.t) - ms(b.t));
+    const out = { today, day };
+    if (withResting) {
+      const since = addDays(today, -30);
+      const pts = await listPoints(token, "daily-resting-heart-rate", [`dailyRestingHeartRate.date >= "${since}"`, `daily_resting_heart_rate.date >= "${since}"`], 100, 2);
+      out.resting = pts.map(p => p.dailyRestingHeartRate).filter(r => r && r.date && r.beatsPerMinute != null)
+        .map(r => ({ day: isoOf({ date: r.date }), bpm: Math.round(+r.beatsPerMinute) })).sort((a, b) => (a.day < b.day ? -1 : 1));
+    }
+    out.syncedAt = await noteSynced(userId, token);
+    return out;
+  });
 }
 
 // ── Notifications ──────────────────────────────────────────────────────────
@@ -240,14 +421,15 @@ async function callback(url) {
   if (!code || !googleReady(cfg)) return backToApp("error");
   const r = await tokenRequest({ grant_type: "authorization_code", code, client_id: cfg.id, client_secret: cfg.secret, redirect_uri: redirectUri() });
   if (!r.ok) { await patchLink(userId, { last_error: `code exchange ${r.status}: ${r.data.error || ""}` }); return backToApp("error"); }
-  if (!String(r.data.scope || "").split(" ").includes(SCOPE)) return backToApp("noscope");   // activity box left unticked
+  const granted = String(r.data.scope || "").split(" ");
+  if (!granted.includes(SCOPE)) return backToApp("noscope");   // activity box left unticked
   const refresh = r.data.refresh_token || link.refresh_token;
   if (!refresh) return backToApp("error");
   await patchLink(userId, {
     refresh_token: refresh, access_token: r.data.access_token, scope: r.data.scope, status: "ok", last_error: null,
     access_expires: new Date(Date.now() + (r.data.expires_in || 3600) * 1000).toISOString(), linked_at: new Date().toISOString(),
   });
-  await setStatus(userId, "linked");
+  await setStatus(userId, "linked", { fit_scopes: ["activity", ...Object.keys(EXTRA).filter(k => granted.includes(EXTRA[k]))].join(" ") });
   try {   // fill in the last two weeks straight away
     const today = ukNow().day;
     await sync(userId, addDays(today, -(MAX_DAYS - 1)), today, cfg);
@@ -281,7 +463,8 @@ export async function handler(req) {
       if (!googleReady(cfg)) return json({ error: "not_configured" });
       const state = randomState();
       await upsert("ct_fit_links", [{ user_id: user.id, pending_state: state, pending_at: new Date().toISOString() }], "user_id");
-      const q = new URLSearchParams({ client_id: cfg.id, redirect_uri: redirectUri(), response_type: "code", access_type: "offline", prompt: "consent", scope: SCOPE, state });
+      const q = new URLSearchParams({ client_id: cfg.id, redirect_uri: redirectUri(), response_type: "code", access_type: "offline", prompt: "consent",
+        scope: [SCOPE, EXTRA.sleep, EXTRA.heart].join(" "), include_granted_scopes: "true", state });
       return json({ url: `${GOOGLE_AUTH}?${q}` });
     }
     if (body.action === "sync") {
@@ -292,6 +475,9 @@ export async function handler(req) {
       if (from < addDays(today, -(MAX_DAYS - 1))) from = addDays(today, -(MAX_DAYS - 1));
       return json(await sync(user.id, from, today, cfg));
     }
+    if (body.action === "live") return json(googleReady(cfg) ? await live(user.id, cfg) : { linked: false, error: "not_configured" });
+    if (body.action === "sleep") return json(googleReady(cfg) ? await sleep(user.id, cfg, +body.days || 30) : { linked: false, error: "not_configured" });
+    if (body.action === "heart") return json(googleReady(cfg) ? await heart(user.id, cfg, !!body.resting) : { linked: false, error: "not_configured" });
     if (body.action === "push_key") return json({ key: (await ensureVapid(cfg)).publicKey });
     if (body.action === "push_test") {
       const s = (await db("GET", `ct_settings?user_id=eq.${user.id}&select=step_goal,remind_hour`) || [])[0] || {};
@@ -303,7 +489,7 @@ export async function handler(req) {
       const link = await getLink(user.id);
       if (link && link.refresh_token) await fetch(`${GOOGLE_REVOKE}?token=${encodeURIComponent(link.refresh_token)}`, { method: "POST" }).catch(() => {});
       await db("DELETE", `ct_fit_links?user_id=eq.${user.id}`, null, "return=minimal");
-      await setStatus(user.id, null);
+      await setStatus(user.id, null, { fit_scopes: null, fit_synced_at: null });
       return json({ linked: false });
     }
     return json({ error: "action" }, 400);

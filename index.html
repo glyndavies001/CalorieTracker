@@ -151,10 +151,36 @@
     .mstat { background: var(--card2); border-radius: 10px; padding: 9px 10px; }
     .mstat .v { font-size: 17px; font-weight: 800; margin-top: 2px; }
     .up { color: var(--red); } .down { color: var(--green); }
+
+    /* health tab and pages */
+    .hcard { cursor: pointer; }
+    .hcard .hic { font-size: 22px; width: 30px; text-align: center; }
+    .hcard .hval { font-size: 24px; font-weight: 800; margin: 2px 0 1px; }
+    .hcard .chev { color: var(--dim); font-size: 22px; }
+    .steps.tap { cursor: pointer; }
+    #page { position: fixed; inset: 0; z-index: 80; background: var(--bg); overflow-y: auto; overscroll-behavior: contain; }
+    .pg { max-width: 640px; margin: 0 auto; padding: calc(10px + env(safe-area-inset-top)) 12px calc(28px + env(safe-area-inset-bottom)); }
+    .pg-top { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+    .pg-top h2 { margin: 0; font-size: 18px; font-weight: 800; }
+    .pg-back { background: var(--card); border: 1px solid var(--line); color: var(--muted); border-radius: 10px; width: 42px; height: 38px; font-size: 22px; line-height: 1; }
+    .hero { font-size: clamp(56px, 20vw, 104px); font-weight: 800; letter-spacing: -2px; line-height: 1.05; margin: 8px 0 14px; color: #fff; white-space: nowrap; }
+    .hero-sm { font-size: 48px; font-weight: 800; letter-spacing: -1px; line-height: 1.1; margin: 4px 0 4px; color: #fff; }
+    .bar.hero-bar { height: 10px; }
+    .hchart { width: 100%; height: auto; display: block; margin-top: 12px; }
+    .hchart [data-act] { cursor: pointer; outline: none; }
+    .hchart [data-act]:focus-visible { stroke: var(--soft); stroke-width: 1; }
+    .skey { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 11px; color: var(--muted); margin-top: 10px; }
+    .skey i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+    .skey b { color: var(--soft); font-weight: 700; }
+    details.tbl summary { cursor: pointer; color: var(--muted); }
+    details.tbl[open] summary { margin-bottom: 6px; }
+    details.tbl .tr { padding: 7px 0; border-top: 1px solid var(--line); gap: 12px; }
+    details.tbl .tv { min-width: 64px; text-align: right; font-variant-numeric: tabular-nums; }
   </style>
 </head>
 <body>
   <div id="app"></div>
+  <div id="page" class="hidden"></div>
   <div id="sheet"></div>
   <div id="toast"></div>
   <script src="/vendor/supabase.js"></script>

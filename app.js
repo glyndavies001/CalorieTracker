@@ -6,7 +6,7 @@
 (function () {
   "use strict";
 
-  const APP_VERSION = "1.5.1";
+  const APP_VERSION = "1.6.0";
   const SUPABASE_URL = "https://yfbarahnwcrwewtpithb.supabase.co";
   const SUPABASE_KEY = "sb_publishable_ItUAbr04KIijWuO-JWgDNg_J5YCwaqK";
   const DIARY_DAYS = 120;   // diary history loaded up front; older days load when opened
@@ -176,7 +176,8 @@
 
   // ── State ─────────────────────────────────────────────────────────────────
   const S = { user: null, loading: true, view: "today", day: isoDay(), foods: [], dishes: [], diary: [], diaryFrom: null, weights: [], settings: {}, foodQuery: "",
-    burn: new Map(), steps: new Map(), fitAt: null, push: { checked: false },   // from the Fitbit: day -> kcal burned, day -> steps; when fetched
+    burn: new Map(), steps: new Map(), push: { checked: false },   // from the Fitbit: day -> kcal burned, day -> steps
+    health: { page: null, live: null, sleep: null, heart: null, shown: null, nightSel: null, hrSel: null, restSel: null },
     sort: pref.get("sort", "az") === "used" ? "used" : "az",
     mode: "day", month: isoDay().slice(0, 7), mSel: null, mLoading: false };   // Today tab: one day, or a month at a time
   const foodsById = () => Object.fromEntries(S.foods.map(f => [f.id, f]));
@@ -227,31 +228,24 @@
       run(() => sb.from("ct_settings").select("*").maybeSingle()),
       run(() => sb.from("ct_weights").select("*").order("day")),
       run(() => sb.from("ct_diary").select("*").gte("day", from).order("created_at")),
-      run(() => sb.from("ct_burn").select("day,kcal,steps,updated_at").gte("day", from)),
+      run(() => sb.from("ct_burn").select("day,kcal,steps").gte("day", from)),
     ]);
     S.foods = foods || [];
     S.dishes = dishes || [];
     S.settings = settings || {};
     S.weights = weights || [];
     S.diary = diary || [];
-    S.burn = new Map(); S.steps = new Map(); S.fitAt = null; takeBurn(burn);
+    S.burn = new Map(); S.steps = new Map(); takeBurn(burn);
     S.diaryFrom = from;
   }
   // Rows from ct_burn (or the server's sync): either number can be missing for a day.
   function takeBurn(rows) {
-    const today = isoDay();
     for (const b of rows || []) {
       if (b.kcal != null) S.burn.set(b.day, +b.kcal);
       if (b.steps != null) S.steps.set(b.day, +b.steps);
-      if (b.day === today && b.updated_at && (!S.fitAt || new Date(b.updated_at) > new Date(S.fitAt))) S.fitAt = b.updated_at;
     }
   }
   const fitSig = () => JSON.stringify([S.settings.fit_status, [...S.burn], [...S.steps]]);
-  // "8:11pm": when today's numbers were last fetched from Google.
-  function fitTime() {
-    const d = new Date(S.fitAt), h = d.getHours();
-    return `Updated ${h % 12 || 12}:${String(d.getMinutes()).padStart(2, "0")}${h < 12 ? "am" : "pm"}`;
-  }
 
   // Calories burned and steps come from the Fitbit (Google Health) through the "fitbit" server
   // function: the last two weeks each time (a late watch sync can change earlier days), when the
@@ -271,10 +265,10 @@
       if (data && data.reconnect) S.settings.fit_status = "reauth";
       else if (data && data.linked === false) S.settings.fit_status = null;
       takeBurn(data && data.days);
-      if (data && data.days) S.fitAt = new Date().toISOString();
-      if (ctx || !S.user || S.view !== "today") return;   // redrawn when you get there
+      if (data && data.syncedAt) S.settings.fit_synced_at = data.syncedAt;
+      if (ctx || !S.user || S.health.page || (S.view !== "today" && S.view !== "health")) return;   // redrawn when you get there
       if (fitSig() !== before) render();
-      else { const at = document.getElementById("fitAt"); if (at) at.textContent = fitTime(); }   // just the time
+      else { const at = document.getElementById("fitAt"); if (at) at.textContent = syncedText(); }   // just the time
     } catch (e) { console.error(e); /* offline or Google hiccup: keep what we have */ }
     finally { burnSyncing = false; }
   }
@@ -314,12 +308,12 @@
   function render() {
     if (!S.user) return renderLogin();
     let body = `<div class="empty">Loading…</div>`;
-    if (!S.loading) body = S.view === "foods" ? viewFoods() : S.view === "dishes" ? viewDishes() : S.view === "weight" ? viewWeight() : viewToday();
+    if (!S.loading) body = S.view === "foods" ? viewFoods() : S.view === "dishes" ? viewDishes() : S.view === "weight" ? viewWeight() : S.view === "health" ? viewHealth() : viewToday();
     const tab = (k, ic, l) => `<button data-act="tab" data-v="${k}" class="${S.view === k ? "on" : ""}"><span class="ic">${ic}</span>${l}</button>`;
     $app.innerHTML = `<header class="top"><h1 class="brand">CALORIE<span>TRACKER</span></h1>
         <button class="iconbtn" data-act="settings" aria-label="Settings">⚙️</button></header>
       <main>${body}</main>
-      <nav class="tabs">${tab("today", "🍽️", "Today")}${tab("foods", "🥕", "Foods")}${tab("dishes", "🍲", "Dishes")}${tab("weight", "⚖️", "Weight")}</nav>`;
+      <nav class="tabs">${tab("today", "🍽️", "Today")}${tab("foods", "🥕", "Foods")}${tab("dishes", "🍲", "Dishes")}${tab("weight", "⚖️", "Weight")}${tab("health", "💓", "Health")}</nav>`;
   }
 
   function renderLogin() {
@@ -362,10 +356,10 @@
     const s = S.steps.get(day);
     if (s == null) return "";
     const goal = stepGoal(), done = s >= goal;
-    return `<div class="steps"><div class="row small"><span class="grow muted">Steps <b style="color:var(--soft)">${fmtK(s)}</b> <span class="faint">/ ${fmtK(goal)}</span></span>
+    return `<div class="steps tap" data-act="hopen" data-p="steps" role="button" tabindex="0" aria-label="Steps: open the Steps page"><div class="row small"><span class="grow muted">Steps <b style="color:var(--soft)">${fmtK(s)}</b> <span class="faint">/ ${fmtK(goal)}</span></span>
         ${done ? `<span class="down">✓ Goal reached</span>` : `<span class="muted">${fmtK(goal - s)} ${day === isoDay() ? "to go" : "short"}</span>`}</div>
       <div class="bar thin"><div style="width:${Math.min(100, (s / goal) * 100)}%;background:${done ? "var(--green)" : "var(--blue)"}"></div></div>
-      ${day === isoDay() && S.fitAt ? `<div class="tiny faint" id="fitAt" style="text-align:right;margin-top:4px">${fitTime()}</div>` : ""}</div>`;
+      ${day === isoDay() && S.settings.fit_synced_at ? `<div class="tiny faint" id="fitAt" style="text-align:right;margin-top:4px">${syncedText()}</div>` : ""}</div>`;
   }
   function viewToday() {
     if (S.mode === "month") return modeBar() + viewMonth();
@@ -538,6 +532,413 @@
       svg += `<rect x="${f(L + i * slot)}" y="${T}" width="${f(slot)}" height="${ph + B}" fill="transparent" data-act="mSel" data-day="${d.day}" tabindex="0" role="button" aria-label="${esc(label)}"/>`;
     });
     return `<svg class="mchart" viewBox="0 0 ${W} ${H}" role="group" aria-label="Calories each day">${svg}</svg>`;
+  }
+
+  // ── Health: live steps, sleep and heart rate (from the Fitbit, through the server) ──
+  // The watch reaches Google every few minutes; in between, the Steps page counts on at
+  // your last pace and corrects itself at each sync.
+  const LIVE_CAP = 20;   // minutes past the last sync the count keeps climbing on its own
+  // Steps a minute over the last few minutes Google has (0 once you've stopped).
+  function paceOf(minutes, syncedAt, span = 3) {
+    if (!syncedAt || !minutes || !minutes.length) return 0;
+    const end = Date.parse(syncedAt), from = end - span * 60000;
+    let n = 0;
+    for (const m of minutes) { const t = Date.parse(m.t); if (t > from && t <= end) n += +m.n || 0; }
+    return n / span;
+  }
+  function liveEstimate(base, pace, syncedAt, now) {
+    if (!syncedAt || !(pace > 0)) return base;
+    const mins = Math.min(LIVE_CAP, Math.max(0, (now - Date.parse(syncedAt)) / 60000));
+    return Math.floor(base + pace * mins);
+  }
+  // Never backwards while walking: a small overshoot waits for the real count to catch up;
+  // once you've stopped (or it ran well ahead) it shows the real count.
+  function liveShown(prev, est, pace) {
+    if (prev == null || est >= prev || !(pace > 0)) return est;
+    return prev - est <= pace * 3 ? prev : est;
+  }
+  // One per night: the longest sleep (not a nap) ending on each day, oldest first.
+  function nightsOf(sessions) {
+    const by = new Map();
+    for (const s of sessions || []) {
+      if (s.nap) continue;
+      const day = isoDay(new Date(s.end));
+      const cur = by.get(day);
+      if (!cur || s.asleep > cur.asleep) by.set(day, s);
+    }
+    return [...by.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([day, s]) => ({ day, ...s }));
+  }
+  Object.assign(window.CT, { paceOf, liveEstimate, liveShown, nightsOf });
+
+  const fmtDur = m => { m = Math.round(+m || 0); const h = Math.floor(m / 60), r = m % 60; return h ? `${h}h ${r}m` : `${r}m`; };
+  const clock = t => { const d = new Date(t), h = d.getHours(); return `${h % 12 || 12}:${String(d.getMinutes()).padStart(2, "0")}${h < 12 ? "am" : "pm"}`; };
+  const hourLabel = h => { h = ((h % 24) + 24) % 24; return h === 0 ? "12am" : h === 12 ? "12pm" : h < 12 ? `${h}am` : `${h - 12}pm`; };
+  const ago = t => { const m = Math.max(0, Math.round((Date.now() - Date.parse(t)) / 60000)); return m < 1 ? "just now" : m < 60 ? `${m} min ago` : `${Math.floor(m / 60)} h ${m % 60} min ago`; };
+  const syncedText = () => (S.settings.fit_synced_at ? `Watch synced ${clock(S.settings.fit_synced_at)}` : "");
+  const hasScope = k => String(S.settings.fit_scopes || "").split(" ").includes(k);
+  const f1 = v => (Math.round(v * 10) / 10).toString();
+  const reauthCard = () => `<div class="card row" style="padding:10px 12px;border-color:#5a4a1a">
+      <span class="grow small">Your Fitbit link has run out, so calories burned, steps, sleep and heart rate have stopped updating.</span>
+      <button class="btn blue sm" data-act="fitConnect">Reconnect</button></div>`;
+  const allowCard = k => `<div class="card"><div class="small" style="margin-bottom:10px">${k === "sleep" ? "Sleep" : "Heart rate"} needs one more permission from Google.</div>
+      <button class="btn blue block" data-act="fitConnect">Allow ${k === "sleep" ? "sleep" : "heart rate"}</button>
+      <div class="tiny faint" style="margin-top:8px">You'll see Google's screen again. Leave sleep and heart rate ticked.</div></div>`;
+  const errorCard = () => `<div class="card"><div class="small muted" style="margin-bottom:10px">Couldn't reach your Fitbit data just now.</div>
+      <button class="btn ghost block" data-act="hretry">Try again</button></div>`;
+  const loadingCard = `<div class="empty">Loading…</div>`;
+
+  // Health tab: a card each for steps, sleep and heart rate; tap one for its page.
+  function viewHealth() {
+    if (!S.settings.fit_status) return `<div class="card"><div class="label">Health</div>
+      <p class="small muted" style="margin:8px 0 12px">Connect your Fitbit to see your steps, sleep and heart rate here.</p>
+      <button class="btn blue block" data-act="fitConnect">Connect Fitbit</button></div>`;
+    let html = S.settings.fit_status === "reauth" ? reauthCard() : "";
+    const today = isoDay(), goal = stepGoal(), st = S.steps.get(today);
+    const card = (p, icon, label, value, sub, extra = "") => `<div class="card hcard" data-act="hopen" data-p="${p}" role="button" tabindex="0" aria-label="${label}">
+      <div class="row"><span class="hic" aria-hidden="true">${icon}</span><div class="grow"><div class="label">${label}</div><div class="hval">${value}</div>
+      <div class="small muted">${sub}</div></div><span class="chev" aria-hidden="true">›</span></div>${extra}</div>`;
+    html += card("steps", "👟", "Steps today", st != null ? fmtK(st) : "—",
+      st == null ? "Waiting for the watch" : st >= goal ? `✓ ${fmtK(goal)} reached` : `${fmtK(goal - st)} to go${syncedText() ? " · " + syncedText() : ""}`,
+      st != null ? `<div class="bar thin" style="margin-top:10px"><div style="width:${Math.min(100, (st / goal) * 100)}%;background:${st >= goal ? "var(--green)" : "var(--blue)"}"></div></div>` : "");
+    const sl = S.health.sleep;
+    let sv = "…", ss = "Loading…";
+    if (!hasScope("sleep") || (sl && sl.needScope)) { sv = "—"; ss = "Tap to allow sleep"; }
+    else if (sl && sl.err) { sv = "—"; ss = "Couldn't load it. Tap to try again"; }
+    else if (sl && sl.sessions) {
+      const n = nightsOf(sl.sessions).pop();
+      if (n) { sv = fmtDur(n.asleep); ss = `${n.day === today ? "Last night" : shortDate(n.day)} · ${clock(n.start)} – ${clock(n.end)}`; } else { sv = "—"; ss = "No sleep recorded yet"; }
+    }
+    html += card("sleep", "😴", "Sleep", sv, ss);
+    const hr = S.health.heart;
+    let hv = "…", hs = "Loading…";
+    if (!hasScope("heart") || (hr && hr.needScope)) { hv = "—"; hs = "Tap to allow heart rate"; }
+    else if (hr && hr.err) { hv = "—"; hs = "Couldn't load it. Tap to try again"; }
+    else if (hr && hr.day) {
+      const r = (hr.resting || []).slice(-1)[0], last = hr.day[hr.day.length - 1];
+      hv = r ? `${r.bpm} <span class="small dim">bpm resting</span>` : "—";
+      hs = last ? `Latest ${last.avg} bpm at ${clock(last.t)}` : "No heart rate yet today";
+    }
+    html += card("heart", "❤️", "Heart rate", hv, hs);
+    return html;
+  }
+
+  // Full-screen pages over the app (the phone's back gesture closes them too).
+  const $page = document.getElementById("page");
+  function renderPage() {
+    const p = S.health.page;
+    if (!p) { $page.innerHTML = ""; $page.classList.add("hidden"); return; }
+    const y = $page.scrollTop;
+    $page.classList.remove("hidden");
+    const title = { steps: "Steps", sleep: "Sleep", heart: "Heart rate" }[p];
+    const body = S.settings.fit_status === "reauth" ? reauthCard() : !S.settings.fit_status ? viewHealth()
+      : p === "steps" ? pageSteps() : p === "sleep" ? pageSleep() : pageHeart();
+    $page.innerHTML = `<div class="pg"><div class="pg-top"><button class="pg-back" data-act="pageBack" aria-label="Back">‹</button><h2>${title}</h2></div>${body}</div>`;
+    $page.scrollTop = y;
+    if (p === "steps") tickLive();
+  }
+  function openPage(p) {
+    if (!["steps", "sleep", "heart"].includes(p)) return;
+    Object.assign(S.health, { page: p, shown: null, nightSel: null, hrSel: null, restSel: null });
+    if (p === "steps" && !S.health.live && S.steps.has(isoDay())) S.health.live = { steps: S.steps.get(isoDay()), minutes: [], syncedAt: S.settings.fit_synced_at || null, at: 0 };
+    try { history.pushState({ ctPage: p }, ""); } catch (e) { /* not essential */ }
+    renderPage();
+    $page.scrollTop = 0;
+    healthTimers();
+    keepAwake(p === "steps");
+    const load = p === "steps" ? loadLive() : p === "sleep" ? loadSleep(false) : loadHeart(false);
+    load.then(() => { if (S.health.page === p) renderPage(); });
+  }
+  function closePage(fromHistory) {
+    if (!S.health.page) return;
+    S.health.page = null;
+    keepAwake(false);
+    renderPage();
+    healthTimers();
+    if (!fromHistory && history.state && history.state.ctPage) { try { history.back(); } catch (e) { /* fine */ } }
+    if (S.user && !ctx) render();
+  }
+  window.addEventListener("popstate", () => { if (S.health.page) closePage(true); });
+
+  // Keep the screen on while the Steps page is open (for watching it on the treadmill).
+  let wake = null;
+  async function keepAwake(on) {
+    try {
+      if (on && !wake && "wakeLock" in navigator && !document.hidden) {
+        wake = await navigator.wakeLock.request("screen");
+        wake.addEventListener("release", () => { wake = null; });
+      } else if (!on && wake) { const w = wake; wake = null; await w.release(); }
+    } catch (e) { wake = null; }
+  }
+
+  // Refreshing: every 20 seconds while the Health tab or a page is open, and the live
+  // count ticks four times a second on the Steps page.
+  let hTimer = null, tTimer = null;
+  function healthTimers() {
+    clearInterval(hTimer); clearInterval(tTimer); hTimer = tTimer = null;
+    if (document.hidden || !S.user || S.settings.fit_status !== "linked" || !(S.view === "health" || S.health.page)) return;
+    hTimer = setInterval(healthPoll, 20000);
+    if (S.health.page === "steps") tTimer = setInterval(tickLive, 250);
+  }
+  async function healthPoll() {
+    const p = S.health.page;
+    if (p === "heart") await loadHeart(false);
+    else if (p === "sleep") await loadSleep(false);
+    else await loadLive();
+    if (S.health.page) { if (S.health.page === "steps" && document.getElementById("liveNum")) tickLive(); else renderPage(); }
+    else if (S.view === "health" && !ctx) render();
+  }
+  async function enterHealth() {
+    healthTimers();
+    if (S.settings.fit_status !== "linked") return;
+    await Promise.all([loadLive(), loadSleep(false), loadHeart(false)]);
+    if (S.view === "health" && !ctx && !S.health.page) render();
+  }
+  async function hcall(action, extra) {
+    const { data, error } = await sb.functions.invoke("fitbit", { body: { action, ...(extra || {}) } });
+    if (error) throw oops("Couldn't reach your Fitbit data. Try again.");
+    const d = data || {};
+    if (d.reconnect) S.settings.fit_status = "reauth";
+    else if (d.linked === false) S.settings.fit_status = null;
+    if (d.syncedAt) S.settings.fit_synced_at = d.syncedAt;
+    return d;
+  }
+  async function loadLive() {
+    try {
+      const d = await hcall("live");
+      if (d.today) {
+        S.health.live = { steps: +d.steps || 0, minutes: d.minutes || [], syncedAt: d.syncedAt || S.settings.fit_synced_at || null, day: d.today, at: Date.now() };
+        S.steps.set(d.today, +d.steps || 0);
+      }
+    } catch (e) { console.error(e); }
+  }
+  async function loadSleep(force) {
+    const s = S.health.sleep;
+    if (!force && s && !s.err && Date.now() - s.at < 5 * 60000) return;
+    if (!hasScope("sleep")) { S.health.sleep = { needScope: true, at: Date.now() }; return; }
+    try {
+      const d = await hcall("sleep", { days: 30 });
+      S.health.sleep = d.needScope ? { needScope: true, at: Date.now() } : d.sessions ? { sessions: d.sessions, at: Date.now() } : s;
+    } catch (e) { console.error(e); S.health.sleep = s && s.sessions ? s : { err: true, at: Date.now() }; }
+  }
+  async function loadHeart(force) {
+    const h = S.health.heart;
+    if (!hasScope("heart")) { S.health.heart = { needScope: true, at: Date.now() }; return; }
+    const resting = force || !h || !h.resting || Date.now() - (h.restAt || 0) > 5 * 60000;
+    try {
+      const d = await hcall("heart", { resting });
+      if (d.needScope) S.health.heart = { needScope: true, at: Date.now() };
+      else if (d.day) S.health.heart = { day: d.day, resting: resting ? d.resting || [] : h.resting, restAt: resting ? Date.now() : h.restAt, at: Date.now() };
+    } catch (e) { console.error(e); if (!h || !h.day) S.health.heart = { err: true, at: Date.now() }; }
+  }
+
+  // ── Steps page: a big number that climbs at your pace ──
+  function pageSteps() {
+    const lv = S.health.live, goal = stepGoal();
+    if (!lv) return loadingCard;
+    return `<div class="card">
+        <div class="label">Steps today</div>
+        <div class="hero" id="liveNum">${fmtK(lv.steps)}</div>
+        <div class="bar hero-bar"><div id="liveBar"></div></div>
+        <div class="row small" style="margin-top:8px"><span class="grow muted" id="liveToGo"></span><span class="faint">Goal ${fmtK(goal)}</span></div>
+      </div>
+      <div class="grid2">
+        <div class="mstat"><div class="label">Pace</div><div class="v" id="livePace">–</div></div>
+        <div class="mstat"><div class="label">${fmtK(goal)} at</div><div class="v" id="liveEta">–</div></div>
+      </div>
+      <div class="small muted" id="liveSync" style="margin-top:12px"></div>
+      <div class="tiny faint" id="liveNote" style="margin-top:4px"></div>`;
+  }
+  function tickLive() {
+    const lv = S.health.live, el = id => document.getElementById(id);
+    if (!lv || S.health.page !== "steps" || !el("liveNum")) return;
+    const now = Date.now(), goal = stepGoal();
+    const pace = paceOf(lv.minutes, lv.syncedAt);
+    const shown = S.health.shown = liveShown(S.health.shown, liveEstimate(lv.steps, pace, lv.syncedAt, now), pace);
+    el("liveNum").textContent = fmtK(shown);
+    el("liveBar").style.width = Math.min(100, (shown / goal) * 100) + "%";
+    el("liveBar").style.background = shown >= goal ? "var(--green)" : "var(--blue)";
+    el("liveToGo").textContent = shown >= goal ? "✓ Goal reached" : `${fmtK(goal - shown)} to go`;
+    el("livePace").innerHTML = pace > 0 ? `${Math.round(pace)} <span class="tiny faint">steps/min</span>` : `<span class="dim small">Not walking</span>`;
+    el("liveEta").textContent = shown >= goal ? "Done ✓" : pace > 0 ? clock(now + ((goal - shown) / pace) * 60000) : "–";
+    el("liveSync").textContent = lv.syncedAt ? `Watch synced ${clock(lv.syncedAt)} · ${ago(lv.syncedAt)}` : "Waiting for the watch to sync";
+    el("liveNote").textContent = pace > 0 && lv.syncedAt && now - Date.parse(lv.syncedAt) > 60000 ? "Counting on at your pace until the watch next syncs." : "";
+  }
+
+  // ── Sleep page: a night's stages, and recent nights ──
+  const STAGE_COL = { awake: "#d95926", rem: "#86b6ef", light: "#3987e5", deep: "#1c5cab", restless: "#86b6ef", asleep: "#3987e5" };
+  const STAGE_NAME = { awake: "Awake", rem: "REM", light: "Light", deep: "Deep", restless: "Restless", asleep: "Asleep" };
+  const stageRows = n => (n.type === "classic" ? ["awake", "restless", "asleep"] : ["awake", "rem", "light", "deep"]);
+  function pageSleep() {
+    const sl = S.health.sleep;
+    if (!hasScope("sleep") || (sl && sl.needScope)) return allowCard("sleep");
+    if (!sl) return loadingCard;
+    if (sl.err) return errorCard();
+    const nights = nightsOf(sl.sessions);
+    if (!nights.length) return `<div class="card small muted">No sleep recorded in the last month.</div>`;
+    const i = S.health.nightSel != null && nights[S.health.nightSel] ? S.health.nightSel : nights.length - 1;
+    const n = nights[i];
+    const inBed = Math.round((Date.parse(n.end) - Date.parse(n.start)) / 60000);
+    let html = `<div class="card">
+      <div class="label">${n.day === isoDay() ? "Last night" : "Night to " + esc(shortDate(n.day))}</div>
+      <div class="hero-sm">${fmtDur(n.asleep)} <span class="small dim">asleep</span></div>
+      <div class="small muted">${clock(n.start)} – ${clock(n.end)} · ${fmtDur(inBed)} in bed</div>
+      ${n.stages.length ? stagesSvg(n) + `<div class="skey">${stageRows(n).map(r => `<span><i style="background:${STAGE_COL[r]}"></i>${STAGE_NAME[r]} <b>${fmtDur(n.byStage[r] || 0)}</b></span>`).join("")}</div>` : ""}
+    </div>`;
+    const last = nights.slice(-14), off = nights.length - last.length;
+    const avg = last.reduce((s, x) => s + x.asleep, 0) / last.length;
+    html += `<div class="card"><div class="row"><span class="label grow">Last ${last.length} night${last.length === 1 ? "" : "s"}</span><span class="small muted">Average ${fmtDur(avg)}</span></div>
+      ${nightsSvg(last, off, i, avg)}
+      <div class="tiny faint" style="margin-top:6px">Tap a night to see it above.</div></div>`;
+    html += `<details class="card tbl"><summary class="small">All nights (${nights.length})</summary>${nights.slice().reverse().map(x =>
+      `<div class="row small tr"><span class="grow">${esc(shortDate(x.day))}</span><span class="muted">${clock(x.start)}–${clock(x.end)}</span><b class="tv">${fmtDur(x.asleep)}</b></div>`).join("")}</details>`;
+    return html;
+  }
+  // Each stage on its own row across the night; the hours along the bottom.
+  function stagesSvg(n) {
+    const rows = stageRows(n);
+    const W = 320, L = 52, R = 8, T = 4, rh = 18, gap = 8, B = 20;
+    const t0 = Date.parse(n.start), t1 = Date.parse(n.end), total = Math.max(1, (t1 - t0) / 60000);
+    const pw = W - L - R, bottom = T + rows.length * (rh + gap) - gap, H = bottom + B;
+    const X = m => L + (m / total) * pw;
+    let svg = "";
+    rows.forEach((r, k) => {
+      const y = T + k * (rh + gap);
+      svg += `<rect x="${L}" y="${y}" width="${pw}" height="${rh}" rx="4" fill="#182033"/>`
+        + `<text x="${L - 8}" y="${y + rh / 2 + 3.5}" text-anchor="end" font-size="10.5" fill="#8892b0">${STAGE_NAME[r]}</text>`;
+    });
+    for (const [type, at, len] of n.stages) {
+      const k = rows.indexOf(type);
+      if (k < 0 || !(len > 0)) continue;
+      const y = T + k * (rh + gap), x = X(at), w = Math.max(1.5, X(at + len) - x);
+      svg += `<rect x="${f1(x)}" y="${y}" width="${f1(w)}" height="${rh}" rx="${f1(Math.min(3, w / 2))}" fill="${STAGE_COL[type]}"/>`;
+    }
+    const first = new Date(t0); first.setMinutes(0, 0, 0);
+    if (first.getTime() < t0) first.setHours(first.getHours() + 1);
+    const every = (t1 - t0) / 3600000 > 6 ? 2 : 1;
+    for (let t = first.getTime(), k = 0; t <= t1; t += 3600000, k++) {
+      if (k % every) continue;
+      const x = X((t - t0) / 60000), anchor = x < L + 12 ? "start" : x > W - 14 ? "end" : "middle";
+      svg += `<line x1="${f1(x)}" x2="${f1(x)}" y1="${bottom + 2}" y2="${bottom + 6}" stroke="#3a4460" stroke-width="1"/>`
+        + `<text x="${f1(x)}" y="${bottom + 16}" text-anchor="${anchor}" font-size="9.5" fill="#5a6480">${hourLabel(new Date(t).getHours())}</text>`;
+    }
+    return `<svg class="hchart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Sleep stages, ${clock(n.start)} to ${clock(n.end)}">${svg}</svg>`;
+  }
+  // Rounded-top column from a baseline.
+  function colPath(x, y0, y1, bw, r, fill) {
+    const h = y0 - y1;
+    if (h < 0.5) return "";
+    const rr = Math.min(r, h);
+    return `<path d="M${f1(x)} ${f1(y0)}V${f1(y1 + rr)}A${f1(rr)} ${f1(rr)} 0 0 1 ${f1(x + rr)} ${f1(y1)}H${f1(x + bw - rr)}A${f1(rr)} ${f1(rr)} 0 0 1 ${f1(x + bw)} ${f1(y1 + rr)}V${f1(y0)}Z" fill="${fill}"/>`;
+  }
+  // Hours asleep each night; the chosen night in blue, the rest quieter; the average as a line.
+  function nightsSvg(nights, off, sel, avg) {
+    const W = 320, H = 150, L = 26, R = 26, T = 8, B = 18;
+    const pw = W - L - R, ph = H - T - B, base = T + ph;
+    const top = Math.ceil(Math.max(480, ...nights.map(n => n.asleep)) / 120) * 120;
+    const Y = m => T + ph - (m / top) * ph;
+    const slot = pw / nights.length, bw = Math.min(22, slot - 3), r = Math.min(4, bw / 2);
+    let svg = "";
+    for (let m = 0; m <= top; m += 120) {
+      svg += `<line x1="${L}" x2="${W - R}" y1="${f1(Y(m))}" y2="${f1(Y(m))}" stroke="#1e2535" stroke-width="1"/>`
+        + `<text x="${L - 5}" y="${f1(Y(m) + 3)}" fill="#5a6480" font-size="9" text-anchor="end">${m / 60}h</text>`;
+    }
+    nights.forEach((n, k) => {
+      const x = L + k * slot + (slot - bw) / 2;
+      svg += colPath(x, base, Y(n.asleep), bw, r, off + k === sel ? "#4a9eff" : "#2d4a73");
+      if (nights.length <= 8 || k % 2 === (nights.length - 1) % 2) svg += `<text x="${f1(L + (k + 0.5) * slot)}" y="${H - 5}" fill="#5a6480" font-size="9" text-anchor="middle">${+n.day.slice(8)}</text>`;
+    });
+    svg += `<line x1="${L}" x2="${W - R}" y1="${f1(Y(avg))}" y2="${f1(Y(avg))}" stroke="#c8cee0" stroke-width="1"/>`
+      + `<text x="${W - R + 4}" y="${f1(Y(avg) + 3)}" fill="#8892b0" font-size="9">avg</text>`;
+    nights.forEach((n, k) => {
+      svg += `<rect x="${f1(L + k * slot)}" y="${T}" width="${f1(slot)}" height="${ph + B}" fill="transparent" data-act="nightSel" data-i="${off + k}" tabindex="0" role="button" aria-label="${esc(shortDate(n.day))}: ${fmtDur(n.asleep)} asleep"/>`;
+    });
+    return `<svg class="hchart" viewBox="0 0 ${W} ${H}" role="group" aria-label="Hours asleep each night">${svg}</svg>`;
+  }
+
+  // ── Heart rate page: resting heart rate over the month, and today through the day ──
+  function pageHeart() {
+    const hr = S.health.heart;
+    if (!hasScope("heart") || (hr && hr.needScope)) return allowCard("heart");
+    if (!hr) return loadingCard;
+    if (hr.err) return errorCard();
+    const rest = hr.resting || [], r = rest[rest.length - 1];
+    const avg = rest.length ? rest.reduce((s, x) => s + x.bpm, 0) / rest.length : null;
+    let html = `<div class="card"><div class="label">Resting heart rate</div>
+      <div class="hero-sm">${r ? r.bpm : "–"} <span class="small dim">bpm</span></div>
+      <div class="small muted">${r ? (r.day === isoDay() ? "Today" : esc(shortDate(r.day))) : "None yet"}${avg != null && rest.length > 1 ? ` · ${rest.length}-day average ${Math.round(avg)}` : ""}</div>
+      ${rest.length > 1 ? restingSvg(rest) + `<div class="mread">${restRead(rest)}</div>` : ""}</div>`;
+    const day = hr.day || [], last = day[day.length - 1];
+    html += `<div class="card"><div class="row"><span class="label grow">Today</span><span class="small muted">${last ? `Latest ${last.avg} bpm at ${clock(last.t)}` : "No readings yet"}</span></div>
+      ${day.length ? hrDaySvg(day) + `<div class="mread">${hrRead(day)}</div>` : ""}
+      <div class="tiny faint" style="margin-top:4px">${syncedText()}</div></div>`;
+    if (rest.length) html += `<details class="card tbl"><summary class="small">Resting heart rate by day</summary>${rest.slice().reverse().map(x =>
+      `<div class="row small tr"><span class="grow">${esc(shortDate(x.day))}</span><b class="tv">${x.bpm} bpm</b></div>`).join("")}</details>`;
+    return html;
+  }
+  const hrRead = day => {
+    const d = S.health.hrSel != null && day[S.health.hrSel];
+    return d ? `<b>${clock(d.t)}</b> · ${d.avg} bpm <span class="muted">(${d.min}–${d.max} over 5 minutes)</span>` : `<div class="tiny faint" style="text-align:center">Tap the chart to see a time</div>`;
+  };
+  const restRead = rest => {
+    const d = S.health.restSel != null && rest[S.health.restSel];
+    return d ? `<b>${esc(shortDate(d.day))}</b> · ${d.bpm} bpm resting` : `<div class="tiny faint" style="text-align:center">Tap the chart to see a day</div>`;
+  };
+  const niceSteps = (lo, hi, step) => ({ lo: Math.floor(lo / step) * step, hi: Math.ceil(hi / step) * step });
+  // Today's 5-minute averages as a line, the range within each 5 minutes as a faint band.
+  function hrDaySvg(day) {
+    const W = 320, H = 160, L = 30, R = 10, T = 8, B = 18;
+    const pw = W - L - R, ph = H - T - B, base = T + ph;
+    const mid = new Date(); mid.setHours(0, 0, 0, 0);
+    const t0 = mid.getTime(), span = 86400000;
+    const X = t => L + ((Date.parse(t) - t0) / span) * pw;
+    const { lo, hi } = niceSteps(Math.min(...day.map(d => d.min)) - 3, Math.max(...day.map(d => d.max)) + 3, 20);
+    const Y = v => T + ph - ((v - lo) / (hi - lo || 1)) * ph;
+    let svg = "";
+    for (let v = lo; v <= hi; v += 20) svg += `<line x1="${L}" x2="${W - R}" y1="${f1(Y(v))}" y2="${f1(Y(v))}" stroke="#1e2535" stroke-width="1"/><text x="${L - 5}" y="${f1(Y(v) + 3)}" fill="#5a6480" font-size="9" text-anchor="end">${v}</text>`;
+    for (const h of [0, 6, 12, 18]) {
+      const x = L + (h / 24) * pw;
+      svg += `<text x="${f1(x)}" y="${H - 5}" fill="#5a6480" font-size="9" text-anchor="${h === 0 ? "start" : "middle"}">${hourLabel(h)}</text>`;
+    }
+    const runs = [];   // a gap of over 15 minutes (watch off) breaks the line
+    day.forEach((d, i) => { if (!i || Date.parse(d.t) - Date.parse(day[i - 1].t) > 15 * 60000) runs.push([]); runs[runs.length - 1].push(d); });
+    for (const run of runs) {
+      const top = run.map(d => `${f1(X(d.t))},${f1(Y(d.max))}`), bot = run.slice().reverse().map(d => `${f1(X(d.t))},${f1(Y(d.min))}`);
+      svg += `<polygon points="${top.concat(bot).join(" ")}" fill="#4a9eff" fill-opacity="0.12"/>`;
+      svg += run.length > 1 ? `<polyline points="${run.map(d => `${f1(X(d.t))},${f1(Y(d.avg))}`).join(" ")}" fill="none" stroke="#4a9eff" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`
+        : `<circle cx="${f1(X(run[0].t))}" cy="${f1(Y(run[0].avg))}" r="2" fill="#4a9eff"/>`;
+    }
+    const sel = S.health.hrSel != null && day[S.health.hrSel];
+    if (sel) svg += `<line x1="${f1(X(sel.t))}" x2="${f1(X(sel.t))}" y1="${T}" y2="${base}" stroke="#8892b0" stroke-width="1"/>`;
+    const dot = sel || day[day.length - 1];
+    svg += `<circle cx="${f1(X(dot.t))}" cy="${f1(Y(dot.avg))}" r="4" fill="#4a9eff" stroke="#141824" stroke-width="2"/>`;
+    svg += `<rect x="${L}" y="${T}" width="${pw}" height="${ph + B}" fill="transparent" data-act="hrTap" data-x0="${L}" data-pw="${pw}" data-w="${W}" aria-label="Heart rate through today"/>`;
+    return `<svg class="hchart" viewBox="0 0 ${W} ${H}" role="group" aria-label="Heart rate today">${svg}</svg>`;
+  }
+  // Resting heart rate by day: a line, the latest value labelled at its end.
+  function restingSvg(rest) {
+    const W = 320, H = 130, L = 30, R = 30, T = 10, B = 18;
+    const pw = W - L - R, ph = H - T - B;
+    const { lo, hi } = niceSteps(Math.min(...rest.map(r => r.bpm)) - 2, Math.max(...rest.map(r => r.bpm)) + 2, 5);
+    const X = i => L + (i / Math.max(1, rest.length - 1)) * pw;
+    const Y = v => T + ph - ((v - lo) / (hi - lo || 1)) * ph;
+    let svg = "";
+    for (let v = lo; v <= hi; v += 5) svg += `<line x1="${L}" x2="${W - R}" y1="${f1(Y(v))}" y2="${f1(Y(v))}" stroke="#1e2535" stroke-width="1"/><text x="${L - 5}" y="${f1(Y(v) + 3)}" fill="#5a6480" font-size="9" text-anchor="end">${v}</text>`;
+    svg += `<polyline points="${rest.map((r, i) => `${f1(X(i))},${f1(Y(r.bpm))}`).join(" ")}" fill="none" stroke="#4a9eff" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+    const n = rest.length - 1;
+    svg += `<text x="${L}" y="${H - 5}" fill="#5a6480" font-size="9">${esc(shortDate(rest[0].day))}</text><text x="${W - R}" y="${H - 5}" fill="#5a6480" font-size="9" text-anchor="end">${esc(shortDate(rest[n].day))}</text>`;
+    const s = S.health.restSel != null && rest[S.health.restSel] ? S.health.restSel : null;
+    if (s != null && s !== n) svg += `<line x1="${f1(X(s))}" x2="${f1(X(s))}" y1="${T}" y2="${T + ph}" stroke="#8892b0" stroke-width="1"/><circle cx="${f1(X(s))}" cy="${f1(Y(rest[s].bpm))}" r="4" fill="#4a9eff" stroke="#141824" stroke-width="2"/>`;
+    svg += `<circle cx="${f1(X(n))}" cy="${f1(Y(rest[n].bpm))}" r="4" fill="#4a9eff" stroke="#141824" stroke-width="2"/><text x="${f1(X(n) + 8)}" y="${f1(Y(rest[n].bpm) + 3.5)}" fill="#c8cee0" font-size="10.5" font-weight="700">${rest[n].bpm}</text>`;
+    svg += `<rect x="${L - 6}" y="${T}" width="${pw + 12}" height="${ph + B}" fill="transparent" data-act="restTap" data-x0="${L}" data-pw="${pw}" data-w="${W}" data-n="${rest.length}" aria-label="Resting heart rate by day"/>`;
+    return `<svg class="hchart" viewBox="0 0 ${W} ${H}" role="group" aria-label="Resting heart rate, last ${rest.length} days">${svg}</svg>`;
+  }
+  // Where a tap landed along a chart, in its own units (0..1 across the plot).
+  function tapFrac(el, ev) {
+    const svg = el.ownerSVGElement || el.closest("svg");
+    const box = svg.getBoundingClientRect();
+    const scale = +el.dataset.w / (box.width || +el.dataset.w);
+    const x = ((ev && ev.clientX != null ? ev.clientX : box.left + box.width / 2) - box.left) * scale;
+    return Math.max(0, Math.min(1, (x - +el.dataset.x0) / +el.dataset.pw));
   }
 
   // A–Z, or most used first: how often you've logged each one (your own diary).
@@ -913,10 +1314,11 @@
       <div class="field"><span class="label">Goal weight (optional)</span><div id="goalBox">${weightInputs(unit, st.goal_kg || null, "g")}</div></div>
       ${st.fit_status ? `<div class="field"><span class="label">Daily step goal</span><input class="inp" id="stepGoal" type="number" inputmode="numeric" step="500" value="${+st.step_goal > 0 ? esc(st.step_goal) : ""}" placeholder="10000"></div>` : ""}
       <button class="btn primary block" data-act="saveSettings">Save</button>
-      <div class="field" style="margin-top:16px"><span class="label">Fitbit — calories burned &amp; steps</span><div class="row">
-        ${st.fit_status === "linked" ? `<span class="grow small muted">Connected. Calories burned and steps update when you open the app.</span><button class="btn ghost sm" data-act="fitDisconnect">Disconnect</button>`
+      <div class="field" style="margin-top:16px"><span class="label">Fitbit</span><div class="row">
+        ${st.fit_status === "linked" ? `<span class="grow small muted">Connected. Calories burned, steps, sleep and heart rate come from your Fitbit.</span><button class="btn ghost sm" data-act="fitDisconnect">Disconnect</button>`
           : st.fit_status === "reauth" ? `<span class="grow small" style="color:var(--amber)">The link has run out.</span><button class="btn blue sm" data-act="fitConnect">Reconnect</button>`
-          : `<span class="grow small muted">See the calories you burn and the steps you take each day, from your Fitbit.</span><button class="btn blue sm" data-act="fitConnect">Connect</button>`}</div></div>
+          : `<span class="grow small muted">See the calories you burn, your steps, sleep and heart rate, from your Fitbit.</span><button class="btn blue sm" data-act="fitConnect">Connect</button>`}</div>
+        ${st.fit_status === "linked" && !(hasScope("sleep") && hasScope("heart")) ? `<div class="row" style="margin-top:8px"><span class="grow small" style="color:var(--amber)">Sleep and heart rate need one more permission.</span><button class="btn blue sm" data-act="fitConnect">Allow</button></div>` : ""}</div>
       ${st.fit_status === "linked" ? `<div class="field" id="remindBox">${remindHtml()}</div>` : ""}
       <div class="row" style="margin-top:16px"><span class="grow tiny faint">CalorieTracker v${APP_VERSION}${S.user && S.user.email ? " · " + esc(S.user.email) : ""}</span>
         <button class="btn ghost" data-act="signOut" style="padding:8px 12px;font-size:12px">Sign out</button></div>`);
@@ -1190,7 +1592,30 @@
   const A = {
     closeVeil: (el, ev) => { if (ev.target === el) closeSheet(); },
     closeSheet: () => closeSheet(),
-    tab: el => { S.view = el.dataset.v; closeSheet(); render(); window.scrollTo(0, 0); },
+    tab: el => { S.view = el.dataset.v; closeSheet(); render(); window.scrollTo(0, 0); healthTimers(); if (S.view === "health") enterHealth(); },
+    hopen: el => openPage(el.dataset.p),
+    pageBack: () => closePage(false),
+    nightSel: el => { S.health.nightSel = +el.dataset.i; renderPage(); },
+    hrTap: (el, ev) => {
+      const day = (S.health.heart && S.health.heart.day) || [];
+      if (!day.length) return;
+      const mid = new Date(); mid.setHours(0, 0, 0, 0);
+      const t = mid.getTime() + tapFrac(el, ev) * 86400000;
+      let best = 0;
+      day.forEach((d, i) => { if (Math.abs(Date.parse(d.t) - t) < Math.abs(Date.parse(day[best].t) - t)) best = i; });
+      S.health.hrSel = best; renderPage();
+    },
+    restTap: (el, ev) => {
+      const rest = (S.health.heart && S.health.heart.resting) || [];
+      if (!rest.length) return;
+      S.health.restSel = Math.round(tapFrac(el, ev) * (rest.length - 1)); renderPage();
+    },
+    hretry: () => {
+      const p = S.health.page;
+      if (p === "sleep") { S.health.sleep = null; renderPage(); loadSleep(true).then(renderPage); }
+      else if (p === "heart") { S.health.heart = null; renderPage(); loadHeart(true).then(renderPage); }
+      else { loadLive().then(renderPage); }
+    },
     settings: () => openSettings(),
     goToday: () => { S.day = isoDay(); render(); },
     day: el => busy(null, async () => { S.day = addDays(S.day, +el.dataset.n); render(); await ensureDay(S.day); render(); }),
@@ -1527,6 +1952,7 @@
     if (el && LIVE[el.dataset.live]) LIVE[el.dataset.live](el, ev);
   });
   document.addEventListener("keydown", ev => {
+    if (ev.key === "Escape" && S.health.page) { closePage(false); return; }
     const t = ev.target;
     if (!t || !t.getAttribute) return;
     // chart columns are role="button": Enter or Space picks them, as a click would
@@ -1539,7 +1965,7 @@
   // ── Start ─────────────────────────────────────────────────────────────────
   // Google sends you back to the app with ?fitbit=connected (or why it didn't work).
   const FIT_MSG = {
-    connected: ["Fitbit connected — calories burned and steps now show on each day.", false],
+    connected: ["Fitbit connected. Steps, sleep and heart rate are in the Health tab.", false],
     cancelled: ["Fitbit not connected.", false],
     expired: ["That took too long — tap Connect again.", true],
     noscope: ["Tick the activity box on Google's screen, so the app can see calories burned and steps.", true],
@@ -1559,6 +1985,8 @@
   async function setUser(u) {
     S.user = u;
     S.push = { checked: false };
+    if (S.health.page) closePage(true);
+    S.health = { page: null, live: null, sleep: null, heart: null, shown: null, nightSel: null, hrSel: null, restSel: null };
     closeSheet();
     if (!u) { S.loading = false; render(); return; }
     S.loading = true; render();
@@ -1586,12 +2014,13 @@
   let hiddenAt = 0;
   document.addEventListener("visibilitychange", () => {
     // The camera stops while the app is in the background, and starts again on return.
-    if (document.hidden) { hiddenAt = Date.now(); stopScan(); return; }
+    if (document.hidden) { hiddenAt = Date.now(); stopScan(); healthTimers(); return; }
     if (ctx && ctx.kind === "scan") startScan();
     const t = isoDay();
     if (t !== lastToday) { if (S.day === lastToday) S.day = t; lastToday = t; if (S.user && !ctx) render(); }
     if (S.user && !S.loading && !ctx && hiddenAt && Date.now() - hiddenAt > 60 * 1000) refreshShared();
     if (S.user && !S.loading) syncBurn();   // at most every 2 minutes
+    if (S.user && !S.loading && (S.health.page || S.view === "health")) { healthTimers(); healthPoll(); if (S.health.page === "steps") keepAwake(true); }
     hiddenAt = 0;
   });
 

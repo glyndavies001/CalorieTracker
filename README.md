@@ -25,6 +25,16 @@ Handy details:
   Function (`supabase/functions/fitbit`) handles the Google sign-in and fetches the numbers into `ct_burn`;
   refresh tokens live in `ct_fit_links`, and the Google OAuth client id/secret in `ct_config` — both
   readable only by the server.
+- **Health tab** – Steps, Sleep and Heart rate cards, each opening a full-screen page:
+  - *Steps*: a big number that keeps climbing at your pace between watch syncs (from the last few minutes of
+    minute-by-minute steps), corrected at each sync; pace, when you'll reach the goal, when the watch last synced.
+    Keeps the screen on while open.
+  - *Sleep*: a night's stages (awake, REM, light, deep) on a timeline, the last 14 nights with the average; tap a
+    night to see it.
+  - *Heart rate*: resting heart rate over 30 days, and today in 5-minute steps (average line, range band).
+  Pages refresh every 20 seconds while open. Sleep and heart rate need two extra Google permissions (granted
+  when connecting; `ct_settings.fit_scopes` records which), and are fetched when shown, not stored.
+  "Watch synced" times come from the latest minute of activity data Google has (`ct_settings.fit_synced_at`).
 - **Step reminder** – each phone can opt in (Settings → Step reminder, with a time from 5pm to 10pm). A
   database job (`ct-step-reminder`, pg_cron + pg_net) calls the function every hour with a secret header
   (`cron_key` in `ct_config`); whoever's reminder hour it is (UK time) gets a fresh step count and, if under
