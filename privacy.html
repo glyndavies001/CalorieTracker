@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0d0f14">
+  <title>CalorieTracker · Privacy</title>
+  <link rel="icon" href="/icon-192.png">
+  <style>
+    body { margin: 0; background: #0d0f14; color: #c8cee0; font: 15px/1.6 "DM Sans", "Segoe UI", system-ui, sans-serif; }
+    main { max-width: 680px; margin: 0 auto; padding: 28px 16px 48px; }
+    h1 { color: #fff; font-size: 24px; margin: 0 0 4px; letter-spacing: 1px; }
+    h1 span { color: #00c88c; }
+    h2 { color: #e8eaf0; font-size: 16px; margin: 26px 0 6px; }
+    p, li { margin: 6px 0; }
+    .dim { color: #8892b0; font-size: 13px; }
+    a { color: #4a9eff; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>CALORIE<span>TRACKER</span> privacy</h1>
+  <p class="dim">Last updated 27 September 2026</p>
+
+  <p>CalorieTracker is a private calorie and weight tracker used by one household. It isn't a public service and
+    nobody else can sign up.</p>
+
+  <h2>What it stores</h2>
+  <ul>
+    <li>Your food diary, body weight, daily targets and settings. These are private to your account.</li>
+    <li>The foods and dishes list, which is shared by the household.</li>
+    <li>If you connect a Fitbit: the total calories you burned each day (see below).</li>
+  </ul>
+  <p>Everything is kept in a hosted database (Supabase) behind your login.</p>
+
+  <h2>Google (Fitbit) data</h2>
+  <p>Only if you choose <b>Connect</b>, CalorieTracker asks Google for read-only access to your activity and fitness data
+    through the Google Health API. It reads one thing: the total calories you burned each day. That number is used only to
+    show calories burned and your deficit or surplus inside the app.</p>
+  <ul>
+    <li>It is stored with your private diary and shown only to you — not to the other person in the household.</li>
+    <li>It is never sold, shared, used for advertising, or used to train AI models.</li>
+    <li>The access tokens Google issues are kept on the server, where the app itself can't read them.</li>
+    <li>You can disconnect at any time in Settings (which also revokes access at Google), or from your Google Account under
+      Security → Third-party connections.</li>
+  </ul>
+  <p>CalorieTracker's use and transfer of information received from Google APIs adheres to the
+    <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>,
+    including the Limited Use requirements.</p>
+
+  <h2>Barcodes</h2>
+  <p>When you scan a product, its barcode number is sent to <a href="https://world.openfoodfacts.org">Open Food Facts</a>
+    to look up the product. No personal details are sent with it.</p>
+
+  <h2>Deleting your data</h2>
+  <p>Disconnecting the Fitbit stops any new data being fetched. To have your data deleted, ask the app's owner using
+    the support email shown on Google's sign-in screen.</p>
+</main>
+</body>
+</html>
