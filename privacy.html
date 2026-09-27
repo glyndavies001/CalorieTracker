@@ -29,16 +29,19 @@
   <ul>
     <li>Your food diary, body weight, daily targets and settings. These are private to your account.</li>
     <li>The foods and dishes list, which is shared by the household.</li>
-    <li>If you connect a Fitbit: the total calories you burned each day (see below).</li>
+    <li>If you connect a Fitbit: the total calories you burned and the steps you took each day (see below).</li>
+    <li>If you turn on the step reminder: a notification address for that phone (see below).</li>
   </ul>
   <p>Everything is kept in a hosted database (Supabase) behind your login.</p>
 
   <h2>Google (Fitbit) data</h2>
   <p>Only if you choose <b>Connect</b>, CalorieTracker asks Google for read-only access to your activity and fitness data
-    through the Google Health API. It reads one thing: the total calories you burned each day. That number is used only to
-    show calories burned and your deficit or surplus inside the app.</p>
+    through the Google Health API. It reads two things: the total calories you burned each day and your steps each day.
+    These are used only to show calories burned, your deficit or surplus and your steps inside the app, and — if you turn
+    it on — to send you the evening step reminder.</p>
   <ul>
     <li>It is stored with your private diary and shown only to you — not to the other person in the household.</li>
+    <li>It is fetched when you open the app and, if the step reminder is on, once in the evening to check your steps.</li>
     <li>It is never sold, shared, used for advertising, or used to train AI models.</li>
     <li>The access tokens Google issues are kept on the server, where the app itself can't read them.</li>
     <li>You can disconnect at any time in Settings (which also revokes access at Google), or from your Google Account under
@@ -47,6 +50,12 @@
   <p>CalorieTracker's use and transfer of information received from Google APIs adheres to the
     <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>,
     including the Limited Use requirements.</p>
+
+  <h2>Notifications</h2>
+  <p>If you turn on the step reminder, your phone's browser gives the app an address to send notifications to. It is
+    stored with your account and used only for that reminder. Notifications travel through your phone's own push service
+    (Google on Android, Apple on iPhone) encrypted, so only your phone can read them. Turning the reminder off, or signing
+    out, removes the address.</p>
 
   <h2>Barcodes</h2>
   <p>When you scan a product, its barcode number is sent to <a href="https://world.openfoodfacts.org">Open Food Facts</a>

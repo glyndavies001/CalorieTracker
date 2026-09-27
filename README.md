@@ -18,11 +18,19 @@ Handy details:
 - **Fixed portions** – a food can have a set amount (e.g. one pack of noodles); tapping it adds it in one go, with Undo.
 - **Remembered amounts** – adding a food or dish starts at the amount you last logged for it.
 - **Sorting** – Foods and Dishes can be sorted A–Z or by how often you log them (remembered on each device).
-- **Fitbit: calories burned** – each person can connect their Fitbit (Settings). Total calories burned per
-  day come from the Google Health API and show on the Day view (with the deficit or surplus) and the Month
-  view (a line over the columns, plus averages). The `fitbit` Supabase Edge Function
-  (`supabase/functions/fitbit`) handles the Google sign-in and fetches the numbers; refresh tokens live in
-  `ct_fit_links`, and the Google OAuth client id/secret in `ct_config` — both readable only by the server.
+- **Fitbit: calories burned and steps** – each person can connect their Fitbit (Settings). Total calories
+  burned and steps per day come from the Google Health API and show on the Day view (burned with the deficit
+  or surplus; steps against the step goal, 10,000 unless changed in Settings) and the Month view (a burned
+  line over the columns, average burned and steps, days the step goal was hit). The `fitbit` Supabase Edge
+  Function (`supabase/functions/fitbit`) handles the Google sign-in and fetches the numbers into `ct_burn`;
+  refresh tokens live in `ct_fit_links`, and the Google OAuth client id/secret in `ct_config` — both
+  readable only by the server.
+- **Step reminder** – each phone can opt in (Settings → Step reminder, with a time from 5pm to 10pm). A
+  database job (`ct-step-reminder`, pg_cron + pg_net) calls the function every hour with a secret header
+  (`cron_key` in `ct_config`); whoever's reminder hour it is (UK time) gets a fresh step count and, if under
+  their goal, a notification (Web Push, encrypted, signed with a VAPID key pair the function makes on first
+  use and keeps in `ct_config`). Phones' subscriptions are in `ct_push_subs`. On iPhone this works only when
+  the app is on the Home Screen (iOS 16.4+).
 
 ## How it's built
 

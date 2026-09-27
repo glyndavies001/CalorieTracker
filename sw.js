@@ -18,6 +18,32 @@ self.addEventListener("activate", (event) => {
   );
 });
 
+// Step reminders, sent by the server (Web Push). Every push shows a notification.
+self.addEventListener("push", (event) => {
+  let d = {};
+  try { d = event.data ? event.data.json() : {}; } catch (e) { d = { body: event.data ? event.data.text() : "" }; }
+  event.waitUntil(self.registration.showNotification(d.title || "CalorieTracker", {
+    body: d.body || "",
+    icon: "/icon-192.png",
+    badge: "/badge-96.png",
+    tag: d.tag || "ct",
+    renotify: true,
+    data: { url: d.url || "/" },
+  }));
+});
+
+// Tapping it opens the app (or brings it to the front).
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const url = new URL((event.notification.data && event.notification.data.url) || "/", self.location.origin);
+  event.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((list) => {
+      const open = list.find((c) => new URL(c.url).origin === url.origin && "focus" in c);
+      return open ? open.focus() : self.clients.openWindow(url.href);
+    })
+  );
+});
+
 self.addEventListener("fetch", (event) => {
   const req = event.request;
   const url = new URL(req.url);
