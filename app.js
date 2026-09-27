@@ -1,10 +1,11 @@
 /* CalorieTracker — foods, dishes built from those foods, a daily diary with
    calories and macros, and body weight. Plain JavaScript with no build step.
-   Data lives in Supabase (the ct_* tables) and is private to whoever signs in. */
+   Data lives in Supabase (the ct_* tables). Foods and dishes are one list shared
+   by the household; diary, weights and settings are private to each login. */
 (function () {
   "use strict";
 
-  const APP_VERSION = "1.0.0";
+  const APP_VERSION = "1.1.0";
   const SUPABASE_URL = "https://yfbarahnwcrwewtpithb.supabase.co";
   const SUPABASE_KEY = "sb_publishable_ItUAbr04KIijWuO-JWgDNg_J5YCwaqK";
   const DIARY_DAYS = 120;   // diary history loaded up front; older days load when opened
@@ -225,8 +226,9 @@
     if (!list.length) return `<div class="card empty">No foods match “${esc(S.foodQuery)}”.</div>`;
     return `<div class="list">${list.map(f => `<div class="item tap" data-act="editFood" data-id="${f.id}">
       <div class="grow"><div class="name ellip">${esc(f.name)}</div><div class="macros">${macroLine(f)}</div></div>
-      <div style="text-align:right"><div class="kcal">${fmtK(f.kcal)}</div><div class="tiny faint">per ${basisText(f.unit)}</div></div></div>`).join("")}</div>`;
+      <div style="text-align:right"><div class="kcal">${fmtK(f.kcal)}</div><div class="tiny faint">per ${basisText(f.unit)}</div></div></div>`).join("")}</div>${sharedNote}`;
   }
+  const sharedNote = `<div class="tiny faint" style="text-align:center;margin:-4px 0 12px">Shared with your household · diaries stay private</div>`;
 
   function viewDishes() {
     let html = `<button class="btn primary block" data-act="newDish" style="margin-bottom:12px">+ New dish</button>`;
@@ -241,7 +243,7 @@
           <div class="sub">${esc(amountText(d.portions, "portion"))} · ${n} ingredient${n === 1 ? "" : "s"}${t.missing ? ` · <span style="color:var(--amber)">${t.missing} missing</span>` : ""}</div>
           <div class="macros">${macroLine(per)}</div></div>
         <div style="text-align:right"><div class="kcal">${fmtK(per.kcal)}</div><div class="tiny faint">per portion</div></div></div>`;
-    }).join("")}</div>`;
+    }).join("")}</div>${sharedNote}`;
     return html;
   }
 
@@ -610,6 +612,8 @@
       if ([vals.protein, vals.carbs, vals.fat].some(v => v < 0)) { toast("Values can't be negative.", true); return; }
       const stored = toStored(ctx.unit, ctx.basis, vals);
       if (!stored) { toast("Enter the weight the values are for.", true); return; }
+      const dup = S.foods.find(f => f.id !== ctx.id && f.name.trim().toLowerCase() === name.toLowerCase());
+      if (dup && !window.confirm(`There's already a food called “${dup.name}”. Save another one anyway?`)) return;
       const row = { name, unit: ctx.unit, ...stored, updated_at: new Date().toISOString() };
       let saved;
       if (ctx.id) {
@@ -626,6 +630,7 @@
     }),
     deleteFood: el => busy(el, async () => {
       const id = ctx.id;
+      S.dishes = (await run(() => sb.from("ct_dishes").select("*"))) || S.dishes;
       const used = S.dishes.filter(d => (d.items || []).some(it => it.food_id === id));
       if (used.length) { toast(`Used in ${used.map(d => d.name).join(", ")} — remove it there first.`, true); return; }
       if (!window.confirm("Delete this food? Diary entries already logged keep their calories.")) return;
@@ -655,6 +660,8 @@
       const items = d.items.filter(it => it.amount > 0 && S.foods.some(f => f.id === it.food_id));
       if (!items.length) { toast("Add at least one ingredient.", true); return; }
       if (!(d.portions > 0)) { toast("Portions must be more than 0.", true); return; }
+      const dup = S.dishes.find(x => x.id !== ctx.id && x.name.trim().toLowerCase() === name.toLowerCase());
+      if (dup && !window.confirm(`There's already a dish called “${dup.name}”. Save another one anyway?`)) return;
       const row = { name, portions: d.portions, cooked_grams: d.cooked_grams, items, updated_at: new Date().toISOString() };
       if (ctx.id) {
         const saved = await run(() => sb.from("ct_dishes").update(row).eq("id", ctx.id).select().single());
@@ -771,12 +778,26 @@
     S.loading = false; render();
   }
 
+  // Foods and dishes are shared, so fetch them again when coming back to the app
+  // (the other person may have added some). Left alone while a form is open.
+  async function refreshShared() {
+    try {
+      const [foods, dishes] = await Promise.all([run(() => sb.from("ct_foods").select("*")), run(() => sb.from("ct_dishes").select("*"))]);
+      S.foods = foods || S.foods;
+      S.dishes = dishes || S.dishes;
+      if (!ctx) render();
+    } catch (e) { /* offline: keep what we have */ }
+  }
+
   // After midnight, "today" moves on by itself when the app comes back.
   let lastToday = isoDay();
+  let hiddenAt = 0;
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) return;
+    if (document.hidden) { hiddenAt = Date.now(); return; }
     const t = isoDay();
     if (t !== lastToday) { if (S.day === lastToday) S.day = t; lastToday = t; if (S.user && !ctx) render(); }
+    if (S.user && !S.loading && !ctx && hiddenAt && Date.now() - hiddenAt > 60 * 1000) refreshShared();
+    hiddenAt = 0;
   });
 
   function registerSW() {

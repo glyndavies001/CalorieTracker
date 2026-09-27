@@ -13,8 +13,9 @@ Plain HTML and JavaScript with no build step: `index.html`, `app.js`, `sw.js` (n
 service worker), `manifest.json`, the icons, and `vendor/supabase.js` (Supabase JS 2.49.4).
 
 Data lives in the same Supabase project as Vaulted, in the `ct_foods`, `ct_dishes`, `ct_diary`,
-`ct_weights` and `ct_settings` tables. Row-level security keeps every row private to the
-account that created it, so sign in with an existing Vaulted login.
+`ct_weights` and `ct_settings` tables; sign in with an existing Vaulted login. Foods and dishes
+are one list shared by the household (either account can add, edit or delete); the diary,
+weights and settings are private to each account (row-level security).
 
 Diary entries store the calories and macros as they were when logged, so editing a food later
 doesn't change past days.
