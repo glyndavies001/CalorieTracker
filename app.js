@@ -6,7 +6,7 @@
 (function () {
   "use strict";
 
-  const APP_VERSION = "1.5.0";
+  const APP_VERSION = "1.5.1";
   const SUPABASE_URL = "https://yfbarahnwcrwewtpithb.supabase.co";
   const SUPABASE_KEY = "sb_publishable_ItUAbr04KIijWuO-JWgDNg_J5YCwaqK";
   const DIARY_DAYS = 120;   // diary history loaded up front; older days load when opened
@@ -176,7 +176,7 @@
 
   // ── State ─────────────────────────────────────────────────────────────────
   const S = { user: null, loading: true, view: "today", day: isoDay(), foods: [], dishes: [], diary: [], diaryFrom: null, weights: [], settings: {}, foodQuery: "",
-    burn: new Map(), steps: new Map(), push: { checked: false },   // from the Fitbit: day -> kcal burned, day -> steps
+    burn: new Map(), steps: new Map(), fitAt: null, push: { checked: false },   // from the Fitbit: day -> kcal burned, day -> steps; when fetched
     sort: pref.get("sort", "az") === "used" ? "used" : "az",
     mode: "day", month: isoDay().slice(0, 7), mSel: null, mLoading: false };   // Today tab: one day, or a month at a time
   const foodsById = () => Object.fromEntries(S.foods.map(f => [f.id, f]));
@@ -227,42 +227,54 @@
       run(() => sb.from("ct_settings").select("*").maybeSingle()),
       run(() => sb.from("ct_weights").select("*").order("day")),
       run(() => sb.from("ct_diary").select("*").gte("day", from).order("created_at")),
-      run(() => sb.from("ct_burn").select("day,kcal,steps").gte("day", from)),
+      run(() => sb.from("ct_burn").select("day,kcal,steps,updated_at").gte("day", from)),
     ]);
     S.foods = foods || [];
     S.dishes = dishes || [];
     S.settings = settings || {};
     S.weights = weights || [];
     S.diary = diary || [];
-    S.burn = new Map(); S.steps = new Map(); takeBurn(burn);
+    S.burn = new Map(); S.steps = new Map(); S.fitAt = null; takeBurn(burn);
     S.diaryFrom = from;
   }
   // Rows from ct_burn (or the server's sync): either number can be missing for a day.
   function takeBurn(rows) {
+    const today = isoDay();
     for (const b of rows || []) {
       if (b.kcal != null) S.burn.set(b.day, +b.kcal);
       if (b.steps != null) S.steps.set(b.day, +b.steps);
+      if (b.day === today && b.updated_at && (!S.fitAt || new Date(b.updated_at) > new Date(S.fitAt))) S.fitAt = b.updated_at;
     }
+  }
+  const fitSig = () => JSON.stringify([S.settings.fit_status, [...S.burn], [...S.steps]]);
+  // "8:11pm": when today's numbers were last fetched from Google.
+  function fitTime() {
+    const d = new Date(S.fitAt), h = d.getHours();
+    return `Updated ${h % 12 || 12}:${String(d.getMinutes()).padStart(2, "0")}${h < 12 ? "am" : "pm"}`;
   }
 
   // Calories burned and steps come from the Fitbit (Google Health) through the "fitbit" server
-  // function, fetched when the app opens or comes back, at most every 10 minutes.
+  // function: the last two weeks each time (a late watch sync can change earlier days), when the
+  // app opens or comes back, and every couple of minutes while it's open.
+  const SYNC_EVERY = 2 * 60 * 1000;
   let lastBurnSync = 0, burnSyncing = false;
   async function syncBurn(force) {
     if (!S.user || S.settings.fit_status !== "linked" || burnSyncing) return;
-    if (!force && Date.now() - lastBurnSync < 10 * 60 * 1000) return;
+    if (!force && Date.now() - lastBurnSync < SYNC_EVERY) return;
     burnSyncing = true;
     try {
       const today = isoDay();
-      const have = [...S.burn.keys()].filter(d => S.steps.has(d) && d <= today && d >= addDays(today, -13)).sort();
-      const from = have.length ? addDays(have[have.length - 1], -1) : addDays(today, -13);   // yesterday's total firms up overnight
-      const { data, error } = await sb.functions.invoke("fitbit", { body: { action: "sync", today, from } });
+      const { data, error } = await sb.functions.invoke("fitbit", { body: { action: "sync", today, from: addDays(today, -13) } });
       if (error) throw error;
       lastBurnSync = Date.now();
+      const before = fitSig();
       if (data && data.reconnect) S.settings.fit_status = "reauth";
       else if (data && data.linked === false) S.settings.fit_status = null;
       takeBurn(data && data.days);
-      if (!ctx && S.user) render();
+      if (data && data.days) S.fitAt = new Date().toISOString();
+      if (ctx || !S.user || S.view !== "today") return;   // redrawn when you get there
+      if (fitSig() !== before) render();
+      else { const at = document.getElementById("fitAt"); if (at) at.textContent = fitTime(); }   // just the time
     } catch (e) { console.error(e); /* offline or Google hiccup: keep what we have */ }
     finally { burnSyncing = false; }
   }
@@ -352,7 +364,8 @@
     const goal = stepGoal(), done = s >= goal;
     return `<div class="steps"><div class="row small"><span class="grow muted">Steps <b style="color:var(--soft)">${fmtK(s)}</b> <span class="faint">/ ${fmtK(goal)}</span></span>
         ${done ? `<span class="down">✓ Goal reached</span>` : `<span class="muted">${fmtK(goal - s)} ${day === isoDay() ? "to go" : "short"}</span>`}</div>
-      <div class="bar thin"><div style="width:${Math.min(100, (s / goal) * 100)}%;background:${done ? "var(--green)" : "var(--blue)"}"></div></div></div>`;
+      <div class="bar thin"><div style="width:${Math.min(100, (s / goal) * 100)}%;background:${done ? "var(--green)" : "var(--blue)"}"></div></div>
+      ${day === isoDay() && S.fitAt ? `<div class="tiny faint" id="fitAt" style="text-align:right;margin-top:4px">${fitTime()}</div>` : ""}</div>`;
   }
   function viewToday() {
     if (S.mode === "month") return modeBar() + viewMonth();
@@ -1578,9 +1591,12 @@
     const t = isoDay();
     if (t !== lastToday) { if (S.day === lastToday) S.day = t; lastToday = t; if (S.user && !ctx) render(); }
     if (S.user && !S.loading && !ctx && hiddenAt && Date.now() - hiddenAt > 60 * 1000) refreshShared();
-    if (S.user && !S.loading) syncBurn();   // at most every 10 minutes
+    if (S.user && !S.loading) syncBurn();   // at most every 2 minutes
     hiddenAt = 0;
   });
+
+  // While the app is open, calories burned and steps refresh every couple of minutes.
+  setInterval(() => { if (!document.hidden && S.user && !S.loading) syncBurn(); }, 30 * 1000);
 
   function registerSW() {
     if (!("serviceWorker" in navigator)) return;
