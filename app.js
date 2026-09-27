@@ -6,7 +6,7 @@
 (function () {
   "use strict";
 
-  const APP_VERSION = "1.3.0";
+  const APP_VERSION = "1.4.0";
   const SUPABASE_URL = "https://yfbarahnwcrwewtpithb.supabase.co";
   const SUPABASE_KEY = "sb_publishable_ItUAbr04KIijWuO-JWgDNg_J5YCwaqK";
   const DIARY_DAYS = 120;   // diary history loaded up front; older days load when opened
@@ -93,19 +93,26 @@
 
   // Every day of a month with its totals, and averages over the finished days that were logged
   // (today is still going, and a day with nothing logged would only drag the average down).
-  function monthStats(diary, ym, target, today) {
+  // `burn` (day -> kcal burned, from the Fitbit) adds burned and deficit (burned - eaten).
+  function monthStats(diary, ym, target, today, burn) {
     const byDay = new Map();
     for (const e of diary) if (e.day && e.day.slice(0, 7) === ym) { const l = byDay.get(e.day); if (l) l.push(e); else byDay.set(e.day, [e]); }
     const days = [];
     for (let d = 1; d <= daysIn(ym); d++) {
       const iso = `${ym}-${String(d).padStart(2, "0")}`;
       const list = byDay.get(iso) || [];
-      days.push({ day: iso, n: list.length, ...sumN(list), today: iso === today, future: iso > today });
+      const b = burn && burn.has(iso) ? +burn.get(iso) : null;
+      days.push({ day: iso, n: list.length, ...sumN(list), burned: b, today: iso === today, future: iso > today });
     }
     const done = days.filter(x => x.n && x.day < today);
     const under = target ? done.filter(x => Math.round(x.kcal) <= target).length : 0;
+    const burnt = days.filter(x => x.burned != null && x.day < today);
+    const both = done.filter(x => x.burned != null);
+    const deficit = both.reduce((s, x) => s + (Math.round(x.burned) - Math.round(x.kcal)), 0);
     return { days, done: done.length, logged: days.filter(x => x.n).length,
-      avg: done.length ? scaleN(sumN(done), 1 / done.length) : null, under, over: target ? done.length - under : 0 };
+      avg: done.length ? scaleN(sumN(done), 1 / done.length) : null, under, over: target ? done.length - under : 0,
+      avgBurn: burnt.length ? burnt.reduce((s, x) => s + x.burned, 0) / burnt.length : null,
+      defDays: both.length, avgDeficit: both.length ? deficit / both.length : null, deficit };
   }
 
   // ── Formatting ─────────────────────────────────────────────────────────────
@@ -163,7 +170,7 @@
   };
 
   // ── State ─────────────────────────────────────────────────────────────────
-  const S = { user: null, loading: true, view: "today", day: isoDay(), foods: [], dishes: [], diary: [], diaryFrom: null, weights: [], settings: {}, foodQuery: "",
+  const S = { user: null, loading: true, view: "today", day: isoDay(), foods: [], dishes: [], diary: [], diaryFrom: null, weights: [], settings: {}, foodQuery: "", burn: new Map(),
     sort: pref.get("sort", "az") === "used" ? "used" : "az",
     mode: "day", month: isoDay().slice(0, 7), mSel: null, mLoading: false };   // Today tab: one day, or a month at a time
   const foodsById = () => Object.fromEntries(S.foods.map(f => [f.id, f]));
@@ -203,19 +210,48 @@
 
   async function loadAll() {
     const from = addDays(isoDay(), -DIARY_DAYS);
-    const [foods, dishes, settings, weights, diary] = await Promise.all([
+    const [foods, dishes, settings, weights, diary, burn] = await Promise.all([
       run(() => sb.from("ct_foods").select("*")),
       run(() => sb.from("ct_dishes").select("*")),
       run(() => sb.from("ct_settings").select("*").maybeSingle()),
       run(() => sb.from("ct_weights").select("*").order("day")),
       run(() => sb.from("ct_diary").select("*").gte("day", from).order("created_at")),
+      run(() => sb.from("ct_burn").select("day,kcal").gte("day", from)),
     ]);
     S.foods = foods || [];
     S.dishes = dishes || [];
     S.settings = settings || {};
     S.weights = weights || [];
     S.diary = diary || [];
+    S.burn = new Map((burn || []).map(b => [b.day, +b.kcal]));
     S.diaryFrom = from;
+  }
+
+  // Calories burned come from the Fitbit (Google Health) through the "fitbit" server function,
+  // fetched when the app opens or comes back, at most every 10 minutes.
+  let lastBurnSync = 0, burnSyncing = false;
+  async function syncBurn(force) {
+    if (!S.user || S.settings.fit_status !== "linked" || burnSyncing) return;
+    if (!force && Date.now() - lastBurnSync < 10 * 60 * 1000) return;
+    burnSyncing = true;
+    try {
+      const today = isoDay();
+      const have = [...S.burn.keys()].filter(d => d <= today && d >= addDays(today, -13)).sort();
+      const from = have.length ? addDays(have[have.length - 1], -1) : addDays(today, -13);   // yesterday's total firms up overnight
+      const { data, error } = await sb.functions.invoke("fitbit", { body: { action: "sync", today, from } });
+      if (error) throw error;
+      lastBurnSync = Date.now();
+      if (data && data.reconnect) S.settings.fit_status = "reauth";
+      else if (data && data.linked === false) S.settings.fit_status = null;
+      for (const d of (data && data.days) || []) S.burn.set(d.day, +d.kcal);
+      if (!ctx && S.user) render();
+    } catch (e) { console.error(e); /* offline or Google hiccup: keep what we have */ }
+    finally { burnSyncing = false; }
+  }
+  async function fitCall(action) {
+    const { data, error } = await sb.functions.invoke("fitbit", { body: { action } });
+    if (error) throw new Error("The Fitbit link isn't responding — try again in a minute.");
+    return data || {};
   }
   // Days older than the preloaded window are fetched when opened.
   async function ensureDay(day) {
@@ -227,8 +263,12 @@
   async function ensureMonth(ym) {
     const from = ym + "-01", to = `${ym}-${String(daysIn(ym)).padStart(2, "0")}`;
     if ((S.diaryFrom && from >= S.diaryFrom) || loadedMonths.has(ym)) return;
-    const rows = await run(() => sb.from("ct_diary").select("*").gte("day", from).lte("day", to).order("created_at"));
+    const [rows, burn] = await Promise.all([
+      run(() => sb.from("ct_diary").select("*").gte("day", from).lte("day", to).order("created_at")),
+      run(() => sb.from("ct_burn").select("day,kcal").gte("day", from).lte("day", to)),
+    ]);
     S.diary = S.diary.filter(e => e.day < from || e.day > to).concat(rows || []);
+    for (const b of burn || []) S.burn.set(b.day, +b.kcal);
     loadedMonths.add(ym);
   }
   // Month view: older months load when opened; the view stays up, faded, meanwhile.
@@ -274,7 +314,19 @@
       <div class="bar"><div style="width:${w}%;background:${color}"></div></div></div>`;
   }
 
-  const modeBar = () => `<div class="sortbar">${segHtml([["day", "Day"], ["month", "Month"]], S.mode, "mode")}</div>`;
+  const modeBar = () => `<div class="sortbar">${segHtml([["day", "Day"], ["month", "Month"]], S.mode, "mode")}</div>`
+    + (S.settings.fit_status === "reauth" ? `<div class="card row" style="padding:10px 12px;border-color:#5a4a1a">
+        <span class="grow small">Your Fitbit link has run out, so calories burned have stopped updating.</span>
+        <button class="btn blue sm" data-act="fitConnect">Reconnect</button></div>` : "");
+  // Burned (from the Fitbit) and what that leaves: a deficit when you burned more than you ate.
+  function burnLine(day, eaten, logged) {
+    const b = S.burn.get(day);
+    if (b == null) return "";
+    const today = day === isoDay();
+    const net = Math.round(b) - eaten;
+    const verdict = today || !logged ? "" : net >= 0 ? `<span class="down">▼ Deficit ${fmtK(net)}</span>` : `<span class="up">▲ Surplus ${fmtK(-net)}</span>`;
+    return `<div class="row small" style="margin-top:10px"><span class="grow muted">Burned${today ? " so far" : ""} <b style="color:var(--soft)">${fmtK(b)}</b> kcal</span>${verdict}</div>`;
+  }
   function viewToday() {
     if (S.mode === "month") return modeBar() + viewMonth();
     const entries = S.diary.filter(e => e.day === S.day);
@@ -297,6 +349,7 @@
           : `<button class="btn ghost" data-act="settings" style="padding:8px 10px;font-size:12px">Set daily targets</button>`}
       </div>
       ${target ? `<div class="bar" style="margin-top:10px;height:9px"><div style="width:${pct}%;background:${over ? "var(--red)" : "var(--green)"}"></div></div>` : ""}
+      ${burnLine(S.day, eaten, entries.length > 0)}
       ${macroBar(tot, "protein", "Protein", "p", "var(--protein)")}${macroBar(tot, "carbs", "Carbs", "c", "var(--carbs)")}${macroBar(tot, "fat", "Fat", "f", "var(--fat)")}
     </div>`;
     for (const [k, label] of MEALS) {
@@ -323,7 +376,7 @@
   function viewMonth() {
     const target = +S.settings.kcal_target || 0;
     const today = isoDay();
-    const st = monthStats(S.diary, S.month, target, today);
+    const st = monthStats(S.diary, S.month, target, today, S.burn);
     const dim = S.mLoading ? ' style="opacity:.5"' : "";
     const last = S.month >= today.slice(0, 7);
     let html = `<div class="daynav">
@@ -345,6 +398,14 @@
           <div class="mstat"><div class="label">Over</div><div class="v up">▲ ${st.over}</div></div></div>`;
       html += macroBar(a, "protein", "Protein", "p", "var(--protein)") + macroBar(a, "carbs", "Carbs", "c", "var(--carbs)") + macroBar(a, "fat", "Fat", "f", "var(--fat)");
     }
+    if (st.avgBurn != null) {   // from the Fitbit
+      const d = st.avgDeficit;
+      html += `<div class="grid2" style="margin-top:12px">
+          <div class="mstat"><div class="label">Avg burned</div><div class="v">${fmtK(st.avgBurn)}</div></div>
+          ${d == null ? `<div class="mstat"><div class="label">Avg deficit</div><div class="v faint">–</div></div>`
+            : `<div class="mstat"><div class="label">Avg ${d >= 0 ? "deficit" : "surplus"}</div><div class="v ${d >= 0 ? "down" : "up"}">${d >= 0 ? "▼" : "▲"} ${fmtK(Math.abs(d))}</div></div>`}</div>
+        ${st.defDays ? `<div class="tiny faint" style="margin-top:6px">Burned minus eaten: ${fmtK(Math.abs(st.deficit))} kcal ${st.deficit >= 0 ? "deficit" : "surplus"} over ${st.defDays} day${st.defDays === 1 ? "" : "s"}</div>` : ""}`;
+    }
     const unit = S.settings.weight_unit || "kg";
     const ws = S.weights.filter(w => w.day.slice(0, 7) === S.month).sort((x, y) => (x.day < y.day ? -1 : x.day > y.day ? 1 : 0));
     if (ws.length > 1) {
@@ -356,12 +417,13 @@
     html += `</div>`;
 
     if (st.logged) {
+      const burnKey = st.days.some(d => d.burned != null && !d.today) ? `<span><i class="line burn"></i>Burned</span>` : "";
       html += `<div class="card"${dim}><div class="label">Calories each day</div>${monthChartSvg(st, target)}
-        ${target ? `<div class="mkey"><span><i style="background:var(--green)"></i>Under target</span><span><i style="background:var(--red)"></i>Over</span><span><i class="line"></i>Target</span></div>` : ""}
+        ${target || burnKey ? `<div class="mkey">${target ? `<span><i style="background:var(--green)"></i>Under target</span><span><i style="background:var(--red)"></i>Over</span><span><i class="line"></i>Target</span>` : ""}${burnKey}</div>` : ""}
         <div class="mread">${monthReadout(st, target)}</div></div>`;
       // The same numbers as a list — tap a day to open it.
       html += `<div class="list"${dim}>${st.days.filter(d => d.n).reverse().map(d => `<div class="item tap" data-act="openDay" data-day="${d.day}">
-          <div class="grow"><div class="name">${esc(dayLabel(d.day))}</div><div class="sub">${d.n} item${d.n === 1 ? "" : "s"}${d.today ? " · so far" : ""}</div></div>
+          <div class="grow"><div class="name">${esc(dayLabel(d.day))}</div><div class="sub">${d.n} item${d.n === 1 ? "" : "s"}${d.today ? " · so far" : ""}${d.burned != null ? ` · burned ${fmtK(d.burned)}` : ""}</div></div>
           <div style="text-align:right"><div class="kcal">${fmtK(d.kcal)}</div>${target && !d.today ? `<div class="tiny">${vsTarget(d.kcal, target)}</div>` : ""}</div></div>`).join("")}</div>`;
     }
     return html;
@@ -369,7 +431,9 @@
   function monthReadout(st, target) {
     const d = S.mSel && st.days.find(x => x.day === S.mSel);
     if (!d) return `<div class="tiny faint" style="text-align:center;padding-top:10px">Tap a day to see it</div>`;
-    return `<div class="row"><div class="grow"><b>${esc(shortDate(d.day))}</b>${d.today ? " (so far)" : ""} · ${d.n ? `${fmtK(d.kcal)} kcal${target && !d.today ? " · " + vsTarget(d.kcal, target) : ""}` : `<span class="muted">nothing logged</span>`}</div>
+    const net = d.burned != null && d.n && !d.today ? Math.round(d.burned) - Math.round(d.kcal) : null;
+    const burned = d.burned != null ? `<div class="tiny muted" style="margin-top:2px">Burned ${fmtK(d.burned)}${d.today ? " so far" : ""}${net == null ? "" : net >= 0 ? ` · <span class="down">▼ ${fmtK(net)} deficit</span>` : ` · <span class="up">▲ ${fmtK(-net)} surplus</span>`}</div>` : "";
+    return `<div class="row"><div class="grow"><b>${esc(shortDate(d.day))}</b>${d.today ? " (so far)" : ""} · ${d.n ? `${fmtK(d.kcal)} kcal${target && !d.today ? " · " + vsTarget(d.kcal, target) : ""}` : `<span class="muted">nothing logged</span>`}${burned}</div>
       <button class="btn ghost sm" data-act="openDay" data-day="${d.day}">Open ›</button></div>`;
   }
   // Columns grow from one baseline, 4px rounded tops; above the target the excess is red,
@@ -378,7 +442,7 @@
     const W = 320, H = 170, L = 32, R = 4, T = 12, B = 20;
     const pw = W - L - R, ph = H - T - B, base = T + ph;
     const days = st.days, n = days.length;
-    const hi = Math.max(target, 500, ...days.map(d => d.kcal));
+    const hi = Math.max(target, 500, ...days.map(d => d.kcal), ...days.map(d => (d.today ? 0 : d.burned || 0)));
     const raw = hi / 5, mag = Math.pow(10, Math.floor(Math.log10(raw)));
     const step = [1, 2, 2.5, 5, 10].map(k => k * mag).find(s => s >= raw);
     const top = Math.ceil((hi * 1.04) / step) * step;
@@ -409,6 +473,18 @@
       svg += d.today ? `<g opacity=".45">${g}</g>` : g;
     });
     if (target) svg += `<line x1="${L}" x2="${W - R}" y1="${f(Y(target))}" y2="${f(Y(target))}" stroke="#8892b0" stroke-width="1" stroke-dasharray="3 3"/>`;
+    // Burned (from the Fitbit): a 2px line across the columns, broken where a day has no reading.
+    let seg = [];
+    const flush = () => {
+      if (seg.length > 1) svg += `<polyline points="${seg.join(" ")}" fill="none" stroke="#c8cee0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+      else if (seg.length === 1) { const [cx, cy] = seg[0].split(","); svg += `<circle cx="${cx}" cy="${cy}" r="3" fill="#c8cee0"/>`; }
+      seg = [];
+    };
+    days.forEach((d, i) => { if (d.burned == null || d.today || d.future) flush(); else seg.push(`${f(L + (i + 0.5) * slot)},${f(Y(d.burned))}`); });
+    flush();
+    days.forEach((d, i) => {
+      if (d.day === S.mSel && d.burned != null && !d.today) svg += `<circle cx="${f(L + (i + 0.5) * slot)}" cy="${f(Y(d.burned))}" r="4" fill="#c8cee0" stroke="#141824" stroke-width="2"/>`;
+    });
     for (const d of [1, 8, 15, 22, 29]) if (d <= n) svg += `<text x="${f(L + (d - 0.5) * slot)}" y="${H - 5}" fill="#5a6480" font-size="9" text-anchor="middle">${d}</text>`;
     days.forEach((d, i) => {   // tap targets: the whole column, not just the bar
       if (d.future) return;
@@ -790,6 +866,10 @@
       <div class="field"><span class="label">Weight in</span>${segHtml([["kg", "Kilograms"], ["stlb", "Stones & pounds"]], unit, "setUnit")}</div>
       <div class="field"><span class="label">Goal weight (optional)</span><div id="goalBox">${weightInputs(unit, st.goal_kg || null, "g")}</div></div>
       <button class="btn primary block" data-act="saveSettings">Save</button>
+      <div class="field" style="margin-top:16px"><span class="label">Fitbit — calories burned</span><div class="row">
+        ${st.fit_status === "linked" ? `<span class="grow small muted">Connected. Burned calories update when you open the app.</span><button class="btn ghost sm" data-act="fitDisconnect">Disconnect</button>`
+          : st.fit_status === "reauth" ? `<span class="grow small" style="color:var(--amber)">The link has run out.</span><button class="btn blue sm" data-act="fitConnect">Reconnect</button>`
+          : `<span class="grow small muted">See how many calories you burn each day, from your Fitbit.</span><button class="btn blue sm" data-act="fitConnect">Connect</button>`}</div></div>
       <div class="row" style="margin-top:16px"><span class="grow tiny faint">CalorieTracker v${APP_VERSION}${S.user && S.user.email ? " · " + esc(S.user.email) : ""}</span>
         <button class="btn ghost" data-act="signOut" style="padding:8px 12px;font-size:12px">Sign out</button></div>`);
   }
@@ -1019,6 +1099,20 @@
 
     // lists
     sortBy: el => { S.sort = el.dataset.k === "used" ? "used" : "az"; pref.set("sort", S.sort); render(); },
+
+    // Fitbit: Google sign-in happens on Google's page, then Google sends you back to the app
+    fitConnect: el => busy(el, async () => {
+      const data = await fitCall("start");
+      if (data.error === "not_configured") { toast("The Fitbit link isn't set up yet — the Google Cloud part still needs doing.", true); return; }
+      if (!data.url) throw new Error("Couldn't start the Fitbit link — try again.");
+      window.location.href = data.url;
+    }),
+    fitDisconnect: el => busy(el, async () => {
+      if (!window.confirm("Disconnect your Fitbit? Calories burned already fetched stay in your diary.")) return;
+      await fitCall("disconnect");
+      S.settings.fit_status = null;
+      closeSheet(); render(); toast("Fitbit disconnected");
+    }),
 
     // diary
     addEntry: el => openAdd(el.dataset.meal),
@@ -1283,6 +1377,25 @@
   });
 
   // ── Start ─────────────────────────────────────────────────────────────────
+  // Google sends you back to the app with ?fitbit=connected (or why it didn't work).
+  const FIT_MSG = {
+    connected: ["Fitbit connected — calories burned now show on each day.", false],
+    cancelled: ["Fitbit not connected.", false],
+    expired: ["That took too long — tap Connect again.", true],
+    noscope: ["Tick the activity box on Google's screen, so the app can see calories burned.", true],
+    error: ["Couldn't connect the Fitbit — try again.", true],
+  };
+  let fitReturn = null;
+  (function readFitReturn() {
+    const p = new URLSearchParams(window.location.search);
+    const v = p.get("fitbit");
+    if (!v) return;
+    fitReturn = FIT_MSG[v] ? v : "error";
+    p.delete("fitbit");
+    const q = p.toString();
+    try { window.history.replaceState(null, "", window.location.pathname + (q ? "?" + q : "") + window.location.hash); } catch (e) { /* cosmetic */ }
+  })();
+
   async function setUser(u) {
     S.user = u;
     closeSheet();
@@ -1291,6 +1404,8 @@
     try { await loadAll(); }
     catch (e) { console.error(e); toast(isNet(e) ? "No connection — pull down or reopen to try again." : "Couldn't load your data.", true); }
     S.loading = false; render();
+    if (fitReturn) { const [msg, bad] = FIT_MSG[fitReturn]; fitReturn = null; toast(msg, bad); }
+    syncBurn();
   }
 
   // Foods and dishes are shared, so fetch them again when coming back to the app
@@ -1314,6 +1429,7 @@
     const t = isoDay();
     if (t !== lastToday) { if (S.day === lastToday) S.day = t; lastToday = t; if (S.user && !ctx) render(); }
     if (S.user && !S.loading && !ctx && hiddenAt && Date.now() - hiddenAt > 60 * 1000) refreshShared();
+    if (S.user && !S.loading) syncBurn();   // at most every 10 minutes
     hiddenAt = 0;
   });
 

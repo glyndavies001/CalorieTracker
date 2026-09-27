@@ -18,6 +18,11 @@ Handy details:
 - **Fixed portions** – a food can have a set amount (e.g. one pack of noodles); tapping it adds it in one go, with Undo.
 - **Remembered amounts** – adding a food or dish starts at the amount you last logged for it.
 - **Sorting** – Foods and Dishes can be sorted A–Z or by how often you log them (remembered on each device).
+- **Fitbit: calories burned** – each person can connect their Fitbit (Settings). Total calories burned per
+  day come from the Google Health API and show on the Day view (with the deficit or surplus) and the Month
+  view (a line over the columns, plus averages). The `fitbit` Supabase Edge Function
+  (`supabase/functions/fitbit`) handles the Google sign-in and fetches the numbers; refresh tokens live in
+  `ct_fit_links`, and the Google OAuth client id/secret in `ct_config` — both readable only by the server.
 
 ## How it's built
 
