@@ -1,0 +1,812 @@
+/* CalorieTracker — foods, dishes built from those foods, a daily diary with
+   calories and macros, and body weight. Plain JavaScript with no build step.
+   Data lives in Supabase (the ct_* tables) and is private to whoever signs in. */
+(function () {
+  "use strict";
+
+  const APP_VERSION = "1.0.0";
+  const SUPABASE_URL = "https://yfbarahnwcrwewtpithb.supabase.co";
+  const SUPABASE_KEY = "sb_publishable_ItUAbr04KIijWuO-JWgDNg_J5YCwaqK";
+  const DIARY_DAYS = 120;   // diary history loaded up front; older days load when opened
+
+  const MEALS = [["breakfast", "Breakfast"], ["lunch", "Lunch"], ["dinner", "Dinner"], ["snacks", "Snacks"]];
+  const mealName = k => (MEALS.find(m => m[0] === k) || [k, k])[1];
+
+  // ── Nutrition maths ────────────────────────────────────────────────────────
+  const zero = () => ({ kcal: 0, protein: 0, carbs: 0, fat: 0 });
+  const addN = (a, b) => ({ kcal: a.kcal + (+b.kcal || 0), protein: a.protein + (+b.protein || 0), carbs: a.carbs + (+b.carbs || 0), fat: a.fat + (+b.fat || 0) });
+  const scaleN = (a, f) => ({ kcal: (+a.kcal || 0) * f, protein: (+a.protein || 0) * f, carbs: (+a.carbs || 0) * f, fat: (+a.fat || 0) * f });
+  const round1 = n => Math.round((+n || 0) * 10) / 10;
+  const roundN = a => ({ kcal: round1(a.kcal), protein: round1(a.protein), carbs: round1(a.carbs), fat: round1(a.fat) });
+  const sumN = list => list.reduce((a, e) => addN(a, e), zero());
+
+  // Foods keep their values per 100 g / 100 ml, or per single item.
+  const basisOf = unit => (unit === "item" ? 1 : 100);
+  const foodFor = (food, amount) => scaleN(food, (+amount || 0) / basisOf(food.unit));
+  // Label values for `basisAmount` (e.g. a 30 g serving) -> the stored per-100 / per-item values.
+  function toStored(unit, basisAmount, values) {
+    const b = +basisAmount;
+    if (!(b > 0)) return null;
+    return roundN(scaleN(values, basisOf(unit) / b));
+  }
+  // A dish is the sum of its ingredients, live from the foods list.
+  function dishTotals(dish, foodsById) {
+    let t = zero(), grams = 0, missing = 0;
+    for (const it of dish.items || []) {
+      const f = foodsById[it.food_id];
+      if (!f) { missing++; continue; }
+      const amt = +it.amount || 0;
+      t = addN(t, foodFor(f, amt));
+      if (f.unit !== "item") grams += amt;
+    }
+    return { ...t, grams, missing };
+  }
+  // Eaten by portion, or by weight once the cooked dish has been weighed.
+  function dishFor(dish, foodsById, amount, unit) {
+    const t = dishTotals(dish, foodsById);
+    const amt = +amount || 0;
+    if (unit === "g") return dish.cooked_grams ? scaleN(t, amt / +dish.cooked_grams) : zero();
+    return scaleN(t, amt / (+dish.portions || 1));
+  }
+
+  // ── Weight ─────────────────────────────────────────────────────────────────
+  const KG_PER_LB = 0.45359237;
+  function kgToStLb(kg) {
+    const total = (+kg || 0) / KG_PER_LB;
+    let st = Math.floor(total / 14);
+    let lb = Math.round((total - st * 14) * 10) / 10;
+    if (lb >= 14) { st += 1; lb = 0; }
+    return { st, lb };
+  }
+  const stLbToKg = (st, lb) => ((+st || 0) * 14 + (+lb || 0)) * KG_PER_LB;
+  function fmtWeight(kg, unit) {
+    if (unit === "stlb") { const { st, lb } = kgToStLb(kg); return `${st} st ${Math.round(lb * 10) / 10} lb`; }
+    return `${(+kg).toFixed(1)} kg`;
+  }
+  function fmtDelta(kg, unit) {
+    const v = unit === "stlb" ? kg / KG_PER_LB : kg;
+    const sign = Math.abs(v) < 0.05 ? "±" : v < 0 ? "−" : "+";
+    return `${sign}${Math.abs(v).toFixed(1)} ${unit === "stlb" ? "lb" : "kg"}`;
+  }
+
+  // ── Dates (local, never UTC) ──────────────────────────────────────────────
+  const isoDay = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const parseIso = iso => { const [y, m, d] = iso.split("-").map(Number); return new Date(y, m - 1, d); };
+  const addDays = (iso, n) => { const d = parseIso(iso); d.setDate(d.getDate() + n); return isoDay(d); };
+  function dayLabel(iso) {
+    const t = isoDay();
+    if (iso === t) return "Today";
+    if (iso === addDays(t, -1)) return "Yesterday";
+    if (iso === addDays(t, 1)) return "Tomorrow";
+    return parseIso(iso).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
+  }
+  const longDate = iso => parseIso(iso).toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+
+  // ── Formatting ─────────────────────────────────────────────────────────────
+  const fmtK = n => Math.round(+n || 0).toLocaleString("en-GB");
+  const fmtG = n => { const v = +n || 0; return (v >= 10 ? Math.round(v) : Math.round(v * 10) / 10) + "g"; };
+  const fmtAmt = n => String(Math.round((+n || 0) * 100) / 100);
+  const num = v => { const n = parseFloat(String(v == null ? "" : v).replace(",", ".")); return isFinite(n) ? n : NaN; };
+  const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const basisText = unit => (unit === "item" ? "item" : `100 ${unit}`);
+  const unitWord = (unit, n) => (unit === "portion" ? (n === 1 ? "portion" : "portions") : unit === "item" ? (n === 1 ? "item" : "items") : unit);
+  const amountText = (amt, unit) => `${fmtAmt(amt)} ${unitWord(unit, +amt)}`;
+  const macroLine = n => `<span class="p"><b>P</b> ${fmtG(n.protein)}</span> · <span class="c"><b>C</b> ${fmtG(n.carbs)}</span> · <span class="f"><b>F</b> ${fmtG(n.fat)}</span>`;
+  const byName = list => [...list].sort((a, b) => a.name.localeCompare(b.name, "en", { sensitivity: "base" }));
+
+  // Exposed for tests.
+  window.CT = { zero, addN, scaleN, sumN, basisOf, foodFor, toStored, dishTotals, dishFor, kgToStLb, stLbToKg, fmtWeight, fmtDelta, isoDay, addDays, dayLabel, esc, APP_VERSION };
+
+  // ── State ─────────────────────────────────────────────────────────────────
+  const S = { user: null, loading: true, view: "today", day: isoDay(), foods: [], dishes: [], diary: [], diaryFrom: null, weights: [], settings: {}, foodQuery: "" };
+  const foodsById = () => Object.fromEntries(S.foods.map(f => [f.id, f]));
+  let sb = null;
+  let ctx = null;   // what the open sheet is doing
+
+  const $app = document.getElementById("app");
+  const $sheet = document.getElementById("sheet");
+  const $toast = document.getElementById("toast");
+
+  // ── Data ──────────────────────────────────────────────────────────────────
+  const isNet = e => /failed to fetch|networkerror|load failed|network request failed/i.test((e && (e.message || String(e))) || "");
+  // Run a query, retrying once after a dropped connection (e.g. the phone waking up).
+  async function run(make) {
+    let res = await make();
+    if (res.error && isNet(res.error)) { await new Promise(r => setTimeout(r, 1200)); res = await make(); }
+    if (res.error) throw res.error;
+    return res.data;
+  }
+  const errText = e => (isNet(e) ? "No connection — try again." : "Couldn't save: " + ((e && e.message) || e));
+
+  async function loadAll() {
+    const from = addDays(isoDay(), -DIARY_DAYS);
+    const [foods, dishes, settings, weights, diary] = await Promise.all([
+      run(() => sb.from("ct_foods").select("*")),
+      run(() => sb.from("ct_dishes").select("*")),
+      run(() => sb.from("ct_settings").select("*").maybeSingle()),
+      run(() => sb.from("ct_weights").select("*").order("day")),
+      run(() => sb.from("ct_diary").select("*").gte("day", from).order("created_at")),
+    ]);
+    S.foods = foods || [];
+    S.dishes = dishes || [];
+    S.settings = settings || {};
+    S.weights = weights || [];
+    S.diary = diary || [];
+    S.diaryFrom = from;
+  }
+  // Days older than the preloaded window are fetched when opened.
+  async function ensureDay(day) {
+    if (S.diaryFrom && day >= S.diaryFrom) return;
+    const rows = await run(() => sb.from("ct_diary").select("*").eq("day", day).order("created_at"));
+    S.diary = S.diary.filter(e => e.day !== day).concat(rows || []);
+  }
+
+  // ── Rendering ─────────────────────────────────────────────────────────────
+  function render() {
+    if (!S.user) return renderLogin();
+    let body = `<div class="empty">Loading…</div>`;
+    if (!S.loading) body = S.view === "foods" ? viewFoods() : S.view === "dishes" ? viewDishes() : S.view === "weight" ? viewWeight() : viewToday();
+    const tab = (k, ic, l) => `<button data-act="tab" data-v="${k}" class="${S.view === k ? "on" : ""}"><span class="ic">${ic}</span>${l}</button>`;
+    $app.innerHTML = `<header class="top"><h1 class="brand">CALORIE<span>TRACKER</span></h1>
+        <button class="iconbtn" data-act="settings" aria-label="Settings">⚙️</button></header>
+      <main>${body}</main>
+      <nav class="tabs">${tab("today", "🍽️", "Today")}${tab("foods", "🥕", "Foods")}${tab("dishes", "🍲", "Dishes")}${tab("weight", "⚖️", "Weight")}</nav>`;
+  }
+
+  function renderLogin() {
+    $app.innerHTML = `<div class="login"><div class="box">
+      <div style="text-align:center;font-size:44px;margin-bottom:10px">🍽️</div>
+      <h1>CALORIE<span>TRACKER</span></h1>
+      <p class="dim" style="text-align:center;font-size:13px;margin:6px 0 26px">Sign in with your Vaulted account</p>
+      <input class="inp" id="email" type="email" autocomplete="username" placeholder="Email">
+      <input class="inp" id="pw" type="password" autocomplete="current-password" placeholder="Password">
+      <button class="btn primary block" data-act="signIn">Sign in</button>
+      <div class="msg" id="loginMsg"></div>
+      <div style="text-align:right"><button class="iconbtn" style="font-size:12px" data-act="forgot">Forgot password?</button></div>
+    </div></div>`;
+  }
+
+  function macroBar(total, key, label, cls, color) {
+    const tgt = +S.settings[key + "_target"] || 0;
+    const v = total[key];
+    const w = tgt ? Math.min(100, (v / tgt) * 100) : 0;
+    return `<div class="macro"><div class="row"><span class="grow ${cls}" style="font-weight:700">${label}</span>
+      <span class="muted">${fmtG(v)}${tgt ? ` <span class="faint">/ ${fmtG(tgt)}</span>` : ""}</span></div>
+      <div class="bar"><div style="width:${w}%;background:${color}"></div></div></div>`;
+  }
+
+  function viewToday() {
+    const entries = S.diary.filter(e => e.day === S.day);
+    const tot = sumN(entries);
+    const eaten = Math.round(tot.kcal);   // round once, so eaten + left always adds up to the target
+    const target = +S.settings.kcal_target || 0;
+    const over = target > 0 && eaten > target;
+    const pct = target ? Math.min(100, (tot.kcal / target) * 100) : 0;
+    let html = `<div class="daynav">
+      <button data-act="day" data-n="-1" aria-label="Previous day">‹</button>
+      <div class="when" data-act="goToday"><div class="big">${esc(dayLabel(S.day))}</div><div class="tiny dim">${esc(longDate(S.day))}</div></div>
+      <button data-act="day" data-n="1" aria-label="Next day">›</button></div>`;
+    html += `<div class="card">
+      <div class="row" style="align-items:flex-end">
+        <div class="grow"><div class="label">Eaten</div><div class="ring-num">${fmtK(eaten)} <span class="small dim" style="font-weight:600">kcal</span></div></div>
+        ${target
+          ? `<div style="text-align:right"><div class="label">${over ? "Over" : "Left"}</div>
+             <div style="font-size:20px;font-weight:800;color:${over ? "var(--red)" : "var(--green)"}">${fmtK(Math.abs(target - eaten))}</div>
+             <div class="tiny faint">of ${fmtK(target)}</div></div>`
+          : `<button class="btn ghost" data-act="settings" style="padding:8px 10px;font-size:12px">Set daily targets</button>`}
+      </div>
+      ${target ? `<div class="bar" style="margin-top:10px;height:9px"><div style="width:${pct}%;background:${over ? "var(--red)" : "var(--green)"}"></div></div>` : ""}
+      ${macroBar(tot, "protein", "Protein", "p", "var(--protein)")}${macroBar(tot, "carbs", "Carbs", "c", "var(--carbs)")}${macroBar(tot, "fat", "Fat", "f", "var(--fat)")}
+    </div>`;
+    for (const [k, label] of MEALS) {
+      const list = entries.filter(e => e.meal === k);
+      const mt = sumN(list);
+      html += `<div class="list"><div class="head"><span style="font-weight:700;font-size:13px">${label}</span>
+        <span class="row" style="gap:8px"><span class="small muted">${list.length ? fmtK(mt.kcal) + " kcal" : ""}</span>
+        <button class="add" data-act="addEntry" data-meal="${k}">+ Add</button></span></div>
+        ${list.map(e => `<div class="item tap" data-act="editEntry" data-id="${e.id}">
+          <div class="grow"><div class="name ellip">${esc(e.name)}</div><div class="sub">${esc(amountText(e.amount, e.amount_unit))}${e.kind === "dish" ? " · dish" : ""}</div></div>
+          <div style="text-align:right"><div class="kcal">${fmtK(e.kcal)}</div><div class="macros">${macroLine(e)}</div></div></div>`).join("")}
+      </div>`;
+    }
+    return html;
+  }
+
+  function viewFoods() {
+    return `<div class="row" style="margin-bottom:10px">
+        <input class="inp grow" id="foodSearch" data-live="foodSearch" placeholder="Search foods" value="${esc(S.foodQuery)}" autocomplete="off">
+        <button class="btn primary" data-act="newFood" style="padding:10px 14px">+ New</button></div>
+      <div id="foodList">${foodListHtml()}</div>`;
+  }
+  function foodListHtml() {
+    if (!S.foods.length) return `<div class="card empty">No foods yet. Add one straight from the packet — the calories and macros for a weight, like per 100 g.</div>`;
+    const q = S.foodQuery.trim().toLowerCase();
+    const list = byName(S.foods).filter(f => !q || f.name.toLowerCase().includes(q));
+    if (!list.length) return `<div class="card empty">No foods match “${esc(S.foodQuery)}”.</div>`;
+    return `<div class="list">${list.map(f => `<div class="item tap" data-act="editFood" data-id="${f.id}">
+      <div class="grow"><div class="name ellip">${esc(f.name)}</div><div class="macros">${macroLine(f)}</div></div>
+      <div style="text-align:right"><div class="kcal">${fmtK(f.kcal)}</div><div class="tiny faint">per ${basisText(f.unit)}</div></div></div>`).join("")}</div>`;
+  }
+
+  function viewDishes() {
+    let html = `<button class="btn primary block" data-act="newDish" style="margin-bottom:12px">+ New dish</button>`;
+    if (!S.dishes.length) return html + `<div class="card empty">No dishes yet. A dish is a recipe made from your foods: add the ingredients and it works out the calories and macros per portion.</div>`;
+    const fb = foodsById();
+    html += `<div class="list">${byName(S.dishes).map(d => {
+      const t = dishTotals(d, fb);
+      const per = scaleN(t, 1 / (+d.portions || 1));
+      const n = (d.items || []).length;
+      return `<div class="item tap" data-act="editDish" data-id="${d.id}">
+        <div class="grow"><div class="name ellip">${esc(d.name)}</div>
+          <div class="sub">${esc(amountText(d.portions, "portion"))} · ${n} ingredient${n === 1 ? "" : "s"}${t.missing ? ` · <span style="color:var(--amber)">${t.missing} missing</span>` : ""}</div>
+          <div class="macros">${macroLine(per)}</div></div>
+        <div style="text-align:right"><div class="kcal">${fmtK(per.kcal)}</div><div class="tiny faint">per portion</div></div></div>`;
+    }).join("")}</div>`;
+    return html;
+  }
+
+  function weightInputs(unit, kg, prefix) {
+    if (unit === "stlb") {
+      const v = kg ? kgToStLb(kg) : { st: "", lb: "" };
+      return `<div class="grid2"><div class="row"><input class="inp" id="${prefix}St" type="number" inputmode="decimal" step="any" value="${v.st}" placeholder="st"><span class="muted">st</span></div>
+        <div class="row"><input class="inp" id="${prefix}Lb" type="number" inputmode="decimal" step="any" value="${v.lb}" placeholder="lb"><span class="muted">lb</span></div></div>`;
+    }
+    return `<div class="row"><input class="inp" id="${prefix}Kg" type="number" inputmode="decimal" step="any" value="${kg ? (+kg).toFixed(1) : ""}" placeholder="kg"><span class="muted">kg</span></div>`;
+  }
+  function readWeight(unit, prefix) {
+    const val = id => { const el = document.getElementById(id); return el ? el.value : ""; };
+    const kg = unit === "stlb" ? (val(prefix + "St") === "" && val(prefix + "Lb") === "" ? NaN : stLbToKg(num(val(prefix + "St")) || 0, num(val(prefix + "Lb")) || 0)) : num(val(prefix + "Kg"));
+    return kg >= 20 && kg <= 400 ? Math.round(kg * 100) / 100 : NaN;
+  }
+
+  function chartSvg(ws, goal, unit) {
+    const pts = ws.slice(-90);
+    const W = 320, H = 150, P = 12, TOP = 20, BOT = 18;   // label bands above and below the line
+    const xs = pts.map(w => parseIso(w.day).getTime());
+    let lo = Math.min(...pts.map(w => +w.kg)), hi = Math.max(...pts.map(w => +w.kg));
+    if (goal) { lo = Math.min(lo, goal); hi = Math.max(hi, goal); }
+    if (hi - lo < 1) { hi += 0.5; lo -= 0.5; }
+    const x0 = xs[0], x1 = xs[xs.length - 1];
+    const X = t => (x1 === x0 ? W / 2 : P + ((t - x0) / (x1 - x0)) * (W - 2 * P));
+    const Y = v => TOP + ((hi - v) / (hi - lo)) * (H - TOP - BOT);
+    const path = pts.map((w, i) => `${i ? "L" : "M"}${X(xs[i]).toFixed(1)},${Y(+w.kg).toFixed(1)}`).join(" ");
+    const goalLine = goal ? `<line x1="${P}" x2="${W - P}" y1="${Y(goal).toFixed(1)}" y2="${Y(goal).toFixed(1)}" stroke="#00c88c" stroke-dasharray="4 4" stroke-width="1" opacity=".8"/>
+      <text x="${W - P}" y="${(Y(goal) - 4).toFixed(1)}" fill="#00c88c" font-size="9" text-anchor="end">goal</text>` : "";
+    const dots = pts.length <= 45 ? pts.map((w, i) => `<circle cx="${X(xs[i]).toFixed(1)}" cy="${Y(+w.kg).toFixed(1)}" r="2.6" fill="#4a9eff"/>`).join("") : "";
+    return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Weight trend" style="margin-top:12px">
+      <text x="${P}" y="9" fill="#5a6480" font-size="9">${esc(fmtWeight(hi, unit))}</text>
+      <text x="${P}" y="${H - 2}" fill="#5a6480" font-size="9">${esc(fmtWeight(lo, unit))}</text>
+      ${goalLine}<path d="${path}" fill="none" stroke="#4a9eff" stroke-width="2" stroke-linejoin="round"/>${dots}</svg>`;
+  }
+
+  function viewWeight() {
+    const unit = S.settings.weight_unit || "kg";
+    const ws = [...S.weights].sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
+    const today = isoDay();
+    const todays = ws.find(w => w.day === today);
+    const latest = ws[ws.length - 1];
+    let html = `<div class="card"><div class="label" style="margin-bottom:8px">${todays ? "Today's weight" : "Log today's weight"}</div>
+      ${weightInputs(unit, todays ? todays.kg : latest ? latest.kg : null, "w")}
+      <button class="btn primary block" data-act="saveWeight" style="margin-top:10px">${todays ? "Update" : "Save"}</button></div>`;
+    if (!ws.length) return html + `<div class="card empty">No weights logged yet.</div>`;
+    const first = ws[0];
+    const weekAgo = [...ws].reverse().find(w => w.day <= addDays(today, -7));
+    const goal = +S.settings.goal_kg || 0;
+    html += `<div class="card"><div class="row" style="align-items:flex-start">
+      <div class="grow"><div class="label">Latest</div><div style="font-size:22px;font-weight:800">${fmtWeight(latest.kg, unit)}</div><div class="tiny faint">${esc(dayLabel(latest.day))}</div></div>
+      <div style="text-align:right" class="small muted">
+        ${weekAgo && weekAgo !== latest ? `<div>vs a week ago <b class="soft" style="color:var(--soft)">${fmtDelta(latest.kg - weekAgo.kg, unit)}</b></div>` : ""}
+        ${ws.length > 1 ? `<div style="margin-top:3px">since ${esc(dayLabel(first.day))} <b style="color:var(--soft)">${fmtDelta(latest.kg - first.kg, unit)}</b></div>` : ""}
+        ${goal ? `<div style="margin-top:3px">goal ${fmtWeight(goal, unit)} · <b style="color:var(--green)">${Math.abs(latest.kg - goal) < 0.05 ? "reached" : fmtDelta(latest.kg - goal, unit).slice(1) + " to go"}</b></div>` : ""}
+      </div></div>
+      ${ws.length > 1 ? chartSvg(ws, goal, unit) : ""}</div>`;
+    const rev = [...ws].reverse().slice(0, 90);
+    html += `<div class="list">${rev.map((w, i) => {
+      const prev = rev[i + 1];
+      return `<div class="item tap" data-act="editWeight" data-id="${w.id}">
+        <div class="grow"><div class="name">${esc(dayLabel(w.day))}</div>${/^(Today|Yesterday)$/.test(dayLabel(w.day)) ? `<div class="sub">${esc(longDate(w.day))}</div>` : ""}</div>
+        <div style="text-align:right"><div class="kcal">${fmtWeight(w.kg, unit)}</div>${prev ? `<div class="tiny faint">${fmtDelta(w.kg - prev.kg, unit)}</div>` : ""}</div></div>`;
+    }).join("")}</div>`;
+    return html;
+  }
+
+  // ── Sheets ────────────────────────────────────────────────────────────────
+  function showSheet(html) {
+    $sheet.innerHTML = `<div class="veil" data-act="closeVeil"><div class="sheet">${html}</div></div>`;
+  }
+  function closeSheet() { ctx = null; $sheet.innerHTML = ""; }
+  const closeX = `<button class="iconbtn x" data-act="closeSheet" aria-label="Close">✕</button>`;
+  const segHtml = (opts, cur, act) => `<div class="seg">${opts.map(([k, l]) => `<button type="button" data-act="${act}" data-k="${k}" class="${cur === k ? "on" : ""}">${l}</button>`).join("")}</div>`;
+  const nutPreview = (n, note) => `<div class="row"><div class="grow"><div class="label">${note}</div><div class="macros" style="margin-top:4px">${macroLine(n)}</div></div><div class="kcal" style="font-size:18px">${fmtK(n.kcal)} <span class="tiny dim">kcal</span></div></div>`;
+
+  // Add to the diary: pick a food or dish, then an amount.
+  function openAdd(meal) {
+    ctx = { kind: "pick", meal, q: "" };
+    showSheet(pickHtml());
+  }
+  function recentMap() {
+    const m = new Map();
+    for (const e of S.diary) if (e.ref_id) { const t = e.created_at || e.day; if (!m.has(e.ref_id) || m.get(e.ref_id) < t) m.set(e.ref_id, t); }
+    return m;
+  }
+  function pickHtml() {
+    return `${closeX}<h3>Add to ${esc(mealName(ctx.meal))}</h3>
+      <input class="inp search" data-live="pickSearch" placeholder="Search foods and dishes" value="${esc(ctx.q)}" autocomplete="off">
+      <div id="pickList">${pickListHtml()}</div>`;
+  }
+  function pickListHtml() {
+    if (!S.foods.length && !S.dishes.length) return `<div class="empty">No foods yet.</div><button class="btn blue block" data-act="newFoodFromPick">+ Add a food</button>`;
+    const rec = recentMap();
+    const q = ctx.q.trim().toLowerCase();
+    const all = [...S.foods.map(f => ({ kind: "food", obj: f })), ...S.dishes.map(d => ({ kind: "dish", obj: d }))]
+      .filter(x => !q || x.obj.name.toLowerCase().includes(q))
+      .sort((a, b) => {
+        const ra = rec.get(a.obj.id) || "", rb = rec.get(b.obj.id) || "";
+        if (ra !== rb) return ra < rb ? 1 : -1;
+        return a.obj.name.localeCompare(b.obj.name, "en", { sensitivity: "base" });
+      });
+    const newBtn = `<button class="btn ghost block" data-act="newFoodFromPick" style="margin-top:4px">+ New food${ctx.q.trim() ? ` “${esc(ctx.q.trim())}”` : ""}</button>`;
+    if (!all.length) return `<div class="empty">Nothing matches.</div>${newBtn}`;
+    const fb = foodsById();
+    return `<div class="list">${all.slice(0, 80).map(x => {
+      const per = x.kind === "food" ? x.obj : scaleN(dishTotals(x.obj, fb), 1 / (+x.obj.portions || 1));
+      return `<div class="item tap" data-act="pick" data-kind="${x.kind}" data-id="${x.obj.id}">
+        <div class="grow"><div class="name ellip">${esc(x.obj.name)}${x.kind === "dish" ? ` <span class="tiny" style="color:var(--amber)">dish</span>` : ""}</div><div class="macros">${macroLine(per)}</div></div>
+        <div style="text-align:right"><div class="kcal">${fmtK(per.kcal)}</div><div class="tiny faint">per ${x.kind === "food" ? basisText(x.obj.unit) : "portion"}</div></div></div>`;
+    }).join("")}</div>${newBtn}`;
+  }
+  function openAmount(kind, id, meal) {
+    const obj = kind === "food" ? S.foods.find(f => f.id === id) : S.dishes.find(d => d.id === id);
+    if (!obj) return;
+    const unit = kind === "food" ? obj.unit : "portion";
+    ctx = { kind: "amount", item: kind, id, meal, unit, amount: kind === "food" ? basisOf(obj.unit) : 1 };
+    showSheet(amountHtml());
+  }
+  function amountNut() {
+    const fb = foodsById();
+    if (ctx.item === "food") { const f = fb[ctx.id]; return f ? foodFor(f, num(ctx.amount) || 0) : zero(); }
+    const d = S.dishes.find(x => x.id === ctx.id);
+    return d ? dishFor(d, fb, num(ctx.amount) || 0, ctx.unit) : zero();
+  }
+  function amountHtml() {
+    const obj = ctx.item === "food" ? S.foods.find(f => f.id === ctx.id) : S.dishes.find(d => d.id === ctx.id);
+    const units = ctx.item === "food" ? [[obj.unit, unitWord(obj.unit, 2)]] : [["portion", "Portions"], ...(obj.cooked_grams ? [["g", "Grams"]] : [])];
+    return `${closeX}<h3>${esc(obj.name)}</h3>
+      <div class="field"><span class="label">Amount</span>
+        <div class="row"><input class="inp" id="amt" data-live="amt" type="number" inputmode="decimal" step="any" value="${esc(ctx.amount)}" style="max-width:130px">
+        ${units.length > 1 ? `<div class="grow">${segHtml(units, ctx.unit, "amtUnit")}</div>` : `<span class="muted">${esc(units[0][1])}</span>`}</div></div>
+      <div class="field"><span class="label">Meal</span>${segHtml(MEALS, ctx.meal, "amtMeal")}</div>
+      <div class="preview" id="pv">${nutPreview(amountNut(), "This adds")}</div>
+      <button class="btn primary block" data-act="saveEntry">${S.day === isoDay() ? "Add" : "Add to " + esc(dayLabel(S.day))}</button>`;
+  }
+
+  // Edit a diary entry: scaled from what was logged, so history stays as it was.
+  function openEditEntry(id) {
+    const e = S.diary.find(x => x.id === id);
+    if (!e) return;
+    ctx = { kind: "entry", id, meal: e.meal, amount: e.amount };
+    showSheet(entryHtml());
+  }
+  function entryNut() {
+    const e = S.diary.find(x => x.id === ctx.id);
+    const a = num(ctx.amount) || 0;
+    return e && +e.amount ? scaleN(e, a / +e.amount) : zero();
+  }
+  function entryHtml() {
+    const e = S.diary.find(x => x.id === ctx.id);
+    return `${closeX}<h3>${esc(e.name)}</h3>
+      <div class="field"><span class="label">Amount</span><div class="row">
+        <input class="inp" id="amt" data-live="entryAmt" type="number" inputmode="decimal" step="any" value="${esc(ctx.amount)}" style="max-width:130px">
+        <span class="muted">${esc(unitWord(e.amount_unit, 2))}</span></div></div>
+      <div class="field"><span class="label">Meal</span>${segHtml(MEALS, ctx.meal, "entryMeal")}</div>
+      <div class="preview" id="pv">${nutPreview(entryNut(), "Now")}</div>
+      <div class="grid2"><button class="btn danger" data-act="deleteEntry">Delete</button><button class="btn primary" data-act="updateEntry">Save</button></div>`;
+  }
+
+  // Food form. Values are typed exactly as on the label, for whatever weight it shows.
+  function openFood(food, opts = {}) {
+    ctx = {
+      kind: "food", id: food ? food.id : null, then: opts.then || null,
+      name: food ? food.name : opts.name || "", unit: food ? food.unit : "g", basis: food ? basisOf(food.unit) : 100,
+      vals: food ? { kcal: food.kcal, protein: food.protein, carbs: food.carbs, fat: food.fat } : { kcal: "", protein: "", carbs: "", fat: "" },
+    };
+    showSheet(foodHtml());
+  }
+  function foodStoredPreview() {
+    const vals = { kcal: num(ctx.vals.kcal) || 0, protein: num(ctx.vals.protein) || 0, carbs: num(ctx.vals.carbs) || 0, fat: num(ctx.vals.fat) || 0 };
+    const b = num(ctx.basis);
+    if (!(b > 0) || b === basisOf(ctx.unit)) return "";
+    const s = toStored(ctx.unit, b, vals);
+    return nutPreview(s, `Saved as per ${basisText(ctx.unit)}`);
+  }
+  function foodHtml() {
+    const v = ctx.vals;
+    const valIn = (k, label) => `<div><span class="label" style="display:block;margin-bottom:4px">${label}</span>
+      <input class="inp" data-live="fVal" data-k="${k}" type="number" inputmode="decimal" step="any" value="${esc(v[k])}" placeholder="0"></div>`;
+    const pv = foodStoredPreview();
+    return `${closeX}<h3>${ctx.id ? "Edit food" : "New food"}</h3>
+      <div class="field"><span class="label">Name</span><input class="inp" id="fName" data-live="fName" value="${esc(ctx.name)}" placeholder="e.g. Greek yoghurt" autocomplete="off"></div>
+      <div class="field"><span class="label">Measured in</span>${segHtml([["g", "Grams"], ["ml", "Millilitres"], ["item", "Items"]], ctx.unit, "fUnit")}</div>
+      <div class="field"><span class="label">Values for</span><div class="row">
+        <input class="inp" id="fBasis" data-live="fBasis" type="number" inputmode="decimal" step="any" value="${esc(ctx.basis)}" style="max-width:100px">
+        <span class="muted">${ctx.unit === "item" ? "item(s)" : ctx.unit}</span><span class="tiny faint grow">as on the label</span></div></div>
+      <div class="grid4" style="margin-bottom:11px">${valIn("kcal", "kcal")}${valIn("protein", "Protein")}${valIn("carbs", "Carbs")}${valIn("fat", "Fat")}</div>
+      <div class="preview${pv ? "" : " hidden"}" id="fpv">${pv}</div>
+      ${ctx.id ? `<div class="grid2"><button class="btn danger" data-act="deleteFood">Delete</button><button class="btn primary" data-act="saveFood">Save</button></div>`
+               : `<button class="btn primary block" data-act="saveFood">Save food</button>`}`;
+  }
+
+  // Dish form: ingredients from the foods list; totals update as you type.
+  function openDish(dish) {
+    ctx = {
+      kind: "dish", id: dish ? dish.id : null, name: dish ? dish.name : "",
+      portions: dish ? dish.portions : 1, cooked: dish && dish.cooked_grams ? dish.cooked_grams : "",
+      items: dish ? (dish.items || []).map(it => ({ food_id: it.food_id, amount: it.amount })) : [], picking: false, q: "",
+    };
+    showSheet(dishHtml());
+  }
+  const dishDraft = () => ({ items: ctx.items.map(it => ({ food_id: it.food_id, amount: num(it.amount) || 0 })), portions: num(ctx.portions) || 1, cooked_grams: num(ctx.cooked) > 0 ? num(ctx.cooked) : null });
+  function dishTotalsHtml() {
+    const fb = foodsById();
+    const d = dishDraft();
+    const t = dishTotals(d, fb);
+    const per = scaleN(t, 1 / d.portions);
+    return `${nutPreview(per, `Per portion (of ${fmtAmt(d.portions)})`)}
+      <div class="row tiny muted" style="margin-top:8px"><span class="grow">Whole dish ${fmtK(t.kcal)} kcal${t.grams ? ` · ${fmtK(t.grams)} g raw` : ""}</span>
+      ${d.cooked_grams ? `<span>${fmtK((t.kcal / d.cooked_grams) * 100)} kcal per 100 g cooked</span>` : ""}</div>`;
+  }
+  function dishHtml() {
+    const fb = foodsById();
+    const rows = ctx.items.map((it, i) => {
+      const f = fb[it.food_id];
+      if (!f) return `<div class="ing"><span class="small" style="color:var(--amber)">Deleted food</span><span></span><span></span><button class="x-btn" data-act="ingDel" data-i="${i}">✕</button></div>`;
+      return `<div class="ing"><span class="name ellip" style="font-size:13px">${esc(f.name)}</span>
+        <div class="row" style="gap:4px"><input class="inp" id="ing${i}" data-live="ingAmt" data-i="${i}" type="number" inputmode="decimal" step="any" value="${esc(it.amount)}"><span class="tiny dim">${f.unit === "item" ? "×" : f.unit}</span></div>
+        <span class="small muted" style="text-align:right" id="ingK${i}">${fmtK(foodFor(f, num(it.amount) || 0).kcal)}</span>
+        <button class="x-btn" data-act="ingDel" data-i="${i}" aria-label="Remove">✕</button></div>`;
+    }).join("");
+    const picker = ctx.picking ? `<div style="margin-top:8px"><input class="inp search" data-live="ingSearch" placeholder="Search your foods" value="${esc(ctx.q)}" autocomplete="off">
+        <div id="ingPickList">${ingPickHtml()}</div></div>`
+      : `<button class="btn ghost block" data-act="ingAdd" style="margin-top:8px">+ Add ingredient</button>`;
+    return `${closeX}<h3>${ctx.id ? "Edit dish" : "New dish"}</h3>
+      <div class="field"><span class="label">Name</span><input class="inp" id="dName" data-live="dName" value="${esc(ctx.name)}" placeholder="e.g. Chilli con carne" autocomplete="off"></div>
+      <div class="grid2 field">
+        <div><span class="label" style="display:block;margin-bottom:5px">Portions</span><input class="inp" data-live="dPortions" type="number" inputmode="decimal" step="any" value="${esc(ctx.portions)}"></div>
+        <div><span class="label" style="display:block;margin-bottom:5px">Cooked weight (g)</span><input class="inp" data-live="dCooked" type="number" inputmode="decimal" step="any" value="${esc(ctx.cooked)}" placeholder="optional"></div>
+      </div>
+      <div class="label" style="margin:4px 0 2px">Ingredients</div>
+      <div>${rows || `<div class="tiny faint" style="padding:8px 0">None yet.</div>`}</div>
+      ${picker}
+      <div class="preview" id="dpv" style="margin-top:12px">${dishTotalsHtml()}</div>
+      ${ctx.id ? `<div class="grid2"><button class="btn danger" data-act="deleteDish">Delete</button><button class="btn primary" data-act="saveDish">Save</button></div>`
+               : `<button class="btn primary block" data-act="saveDish">Save dish</button>`}`;
+  }
+  function ingPickHtml() {
+    const q = ctx.q.trim().toLowerCase();
+    const list = byName(S.foods).filter(f => !q || f.name.toLowerCase().includes(q)).slice(0, 60);
+    if (!S.foods.length) return `<div class="empty">Add foods first (Foods tab).</div>`;
+    if (!list.length) return `<div class="empty">No foods match.</div>`;
+    return `<div class="list" style="margin-top:6px">${list.map(f => `<div class="item tap" data-act="ingPick" data-id="${f.id}">
+      <div class="grow"><div class="name ellip">${esc(f.name)}</div></div><div class="small muted">${fmtK(f.kcal)} / ${basisText(f.unit)}</div></div>`).join("")}</div>`;
+  }
+
+  function openWeightEntry(id) {
+    const w = S.weights.find(x => x.id === id);
+    if (!w) return;
+    ctx = { kind: "weight", id };
+    const unit = S.settings.weight_unit || "kg";
+    showSheet(`${closeX}<h3>${esc(longDate(w.day))}</h3>
+      <div class="field">${weightInputs(unit, w.kg, "e")}</div>
+      <div class="grid2"><button class="btn danger" data-act="deleteWeight">Delete</button><button class="btn primary" data-act="updateWeight">Save</button></div>`);
+  }
+
+  function openSettings() {
+    const st = S.settings;
+    const unit = st.weight_unit || "kg";
+    ctx = { kind: "settings", unit };
+    const tIn = (k, label) => `<div><span class="label" style="display:block;margin-bottom:4px">${label}</span>
+      <input class="inp" id="t_${k}" type="number" inputmode="decimal" step="any" value="${st[k + "_target"] != null ? esc(st[k + "_target"]) : ""}" placeholder="—"></div>`;
+    showSheet(`${closeX}<h3>Settings</h3>
+      <div class="label" style="margin-bottom:6px">Daily targets</div>
+      <div class="grid4" style="margin-bottom:12px">${tIn("kcal", "kcal")}${tIn("protein", "Protein g")}${tIn("carbs", "Carbs g")}${tIn("fat", "Fat g")}</div>
+      <div class="field"><span class="label">Weight in</span>${segHtml([["kg", "Kilograms"], ["stlb", "Stones & pounds"]], unit, "setUnit")}</div>
+      <div class="field"><span class="label">Goal weight (optional)</span><div id="goalBox">${weightInputs(unit, st.goal_kg || null, "g")}</div></div>
+      <button class="btn primary block" data-act="saveSettings">Save</button>
+      <div class="row" style="margin-top:16px"><span class="grow tiny faint">CalorieTracker v${APP_VERSION}${S.user && S.user.email ? " · " + esc(S.user.email) : ""}</span>
+        <button class="btn ghost" data-act="signOut" style="padding:8px 12px;font-size:12px">Sign out</button></div>`);
+  }
+
+  // ── Toast ─────────────────────────────────────────────────────────────────
+  let toastTimer = null;
+  function toast(msg, err) {
+    clearTimeout(toastTimer);
+    $toast.innerHTML = `<div class="toast${err ? " err" : ""}">${esc(msg)}</div>`;
+    toastTimer = setTimeout(() => { $toast.innerHTML = ""; }, err ? 4500 : 2500);
+  }
+  async function busy(btn, fn) {
+    if (btn) btn.disabled = true;
+    try { await fn(); }
+    catch (e) { console.error(e); toast(errText(e), true); }
+    finally { if (btn && btn.isConnected) btn.disabled = false; }
+  }
+
+  // ── Actions ───────────────────────────────────────────────────────────────
+  const A = {
+    closeVeil: (el, ev) => { if (ev.target === el) closeSheet(); },
+    closeSheet: () => closeSheet(),
+    tab: el => { S.view = el.dataset.v; closeSheet(); render(); window.scrollTo(0, 0); },
+    settings: () => openSettings(),
+    goToday: () => { S.day = isoDay(); render(); },
+    day: el => busy(null, async () => { S.day = addDays(S.day, +el.dataset.n); render(); await ensureDay(S.day); render(); }),
+
+    async signIn(el) {
+      const email = document.getElementById("email").value.trim();
+      const pw = document.getElementById("pw").value;
+      const msg = document.getElementById("loginMsg");
+      if (!email || !pw) { msg.textContent = "Enter your email and password."; return; }
+      el.disabled = true; msg.textContent = "Signing in…";
+      const { data, error } = await sb.auth.signInWithPassword({ email, password: pw });
+      el.disabled = false;
+      if (error) { msg.textContent = error.message; return; }
+      setUser(data.user);
+    },
+    async forgot() {
+      const email = document.getElementById("email").value.trim();
+      const msg = document.getElementById("loginMsg");
+      if (!email) { msg.textContent = "Enter your email first."; return; }
+      await sb.auth.resetPasswordForEmail(email);
+      msg.textContent = "Password reset email sent.";
+    },
+    async signOut() { closeSheet(); await sb.auth.signOut(); setUser(null); },
+
+    // diary
+    addEntry: el => openAdd(el.dataset.meal),
+    pick: el => openAmount(el.dataset.kind, el.dataset.id, ctx.meal),
+    newFoodFromPick: () => openFood(null, { name: ctx.q.trim(), then: { meal: ctx.meal } }),
+    amtUnit: el => { ctx.unit = el.dataset.k; ctx.amount = ctx.unit === "g" ? 100 : 1; showSheet(amountHtml()); },
+    amtMeal: el => { ctx.meal = el.dataset.k; showSheet(amountHtml()); },
+    saveEntry: el => busy(el, async () => {
+      const amount = num(ctx.amount);
+      if (!(amount > 0)) { toast("Enter an amount.", true); return; }
+      const obj = ctx.item === "food" ? S.foods.find(f => f.id === ctx.id) : S.dishes.find(d => d.id === ctx.id);
+      const n = roundN(amountNut());
+      const row = { user_id: S.user.id, day: S.day, meal: ctx.meal, kind: ctx.item, ref_id: ctx.id, name: obj.name, amount, amount_unit: ctx.unit, ...n };
+      const saved = await run(() => sb.from("ct_diary").insert(row).select().single());
+      S.diary.push(saved);
+      closeSheet(); render();
+      toast(`Added ${fmtK(n.kcal)} kcal`);
+    }),
+    editEntry: el => openEditEntry(el.dataset.id),
+    entryMeal: el => { ctx.meal = el.dataset.k; showSheet(entryHtml()); },
+    updateEntry: el => busy(el, async () => {
+      const amount = num(ctx.amount);
+      if (!(amount > 0)) { toast("Enter an amount.", true); return; }
+      const patch = { amount, meal: ctx.meal, ...roundN(entryNut()) };
+      const saved = await run(() => sb.from("ct_diary").update(patch).eq("id", ctx.id).select().single());
+      S.diary = S.diary.map(e => (e.id === ctx.id ? saved : e));
+      closeSheet(); render();
+    }),
+    deleteEntry: el => busy(el, async () => {
+      const id = ctx.id;
+      await run(() => sb.from("ct_diary").delete().eq("id", id));
+      S.diary = S.diary.filter(e => e.id !== id);
+      closeSheet(); render();
+    }),
+
+    // foods
+    newFood: () => openFood(null),
+    editFood: el => openFood(S.foods.find(f => f.id === el.dataset.id)),
+    fUnit: el => {
+      const was = ctx.unit;
+      ctx.unit = el.dataset.k;
+      if (num(ctx.basis) === basisOf(was)) ctx.basis = basisOf(ctx.unit);
+      showSheet(foodHtml());
+    },
+    saveFood: el => busy(el, async () => {
+      const name = ctx.name.trim();
+      if (!name) { toast("Give the food a name.", true); return; }
+      const vals = { kcal: num(ctx.vals.kcal), protein: num(ctx.vals.protein) || 0, carbs: num(ctx.vals.carbs) || 0, fat: num(ctx.vals.fat) || 0 };
+      if (!(vals.kcal >= 0)) { toast("Enter the calories.", true); return; }
+      if ([vals.protein, vals.carbs, vals.fat].some(v => v < 0)) { toast("Values can't be negative.", true); return; }
+      const stored = toStored(ctx.unit, ctx.basis, vals);
+      if (!stored) { toast("Enter the weight the values are for.", true); return; }
+      const row = { name, unit: ctx.unit, ...stored, updated_at: new Date().toISOString() };
+      let saved;
+      if (ctx.id) {
+        saved = await run(() => sb.from("ct_foods").update(row).eq("id", ctx.id).select().single());
+        S.foods = S.foods.map(f => (f.id === saved.id ? saved : f));
+      } else {
+        saved = await run(() => sb.from("ct_foods").insert({ ...row, user_id: S.user.id }).select().single());
+        S.foods.push(saved);
+      }
+      const then = ctx.then;
+      closeSheet(); render();
+      if (then) openAmount("food", saved.id, then.meal);   // straight on to logging it
+      else toast("Saved");
+    }),
+    deleteFood: el => busy(el, async () => {
+      const id = ctx.id;
+      const used = S.dishes.filter(d => (d.items || []).some(it => it.food_id === id));
+      if (used.length) { toast(`Used in ${used.map(d => d.name).join(", ")} — remove it there first.`, true); return; }
+      if (!window.confirm("Delete this food? Diary entries already logged keep their calories.")) return;
+      await run(() => sb.from("ct_foods").delete().eq("id", id));
+      S.foods = S.foods.filter(f => f.id !== id);
+      closeSheet(); render();
+    }),
+
+    // dishes
+    newDish: () => openDish(null),
+    editDish: el => openDish(S.dishes.find(d => d.id === el.dataset.id)),
+    ingAdd: () => { ctx.picking = true; ctx.q = ""; showSheet(dishHtml()); const s = $sheet.querySelector("[data-live=ingSearch]"); if (s) s.focus(); },
+    ingPick: el => {
+      const f = S.foods.find(x => x.id === el.dataset.id);
+      if (!f) return;
+      ctx.items.push({ food_id: f.id, amount: basisOf(f.unit) });
+      ctx.picking = false;
+      showSheet(dishHtml());
+      const inp = document.getElementById("ing" + (ctx.items.length - 1));
+      if (inp) { inp.focus(); inp.select(); }
+    },
+    ingDel: el => { ctx.items.splice(+el.dataset.i, 1); showSheet(dishHtml()); },
+    saveDish: el => busy(el, async () => {
+      const name = ctx.name.trim();
+      const d = dishDraft();
+      if (!name) { toast("Give the dish a name.", true); return; }
+      const items = d.items.filter(it => it.amount > 0 && S.foods.some(f => f.id === it.food_id));
+      if (!items.length) { toast("Add at least one ingredient.", true); return; }
+      if (!(d.portions > 0)) { toast("Portions must be more than 0.", true); return; }
+      const row = { name, portions: d.portions, cooked_grams: d.cooked_grams, items, updated_at: new Date().toISOString() };
+      if (ctx.id) {
+        const saved = await run(() => sb.from("ct_dishes").update(row).eq("id", ctx.id).select().single());
+        S.dishes = S.dishes.map(x => (x.id === saved.id ? saved : x));
+      } else {
+        const saved = await run(() => sb.from("ct_dishes").insert({ ...row, user_id: S.user.id }).select().single());
+        S.dishes.push(saved);
+      }
+      closeSheet(); render(); toast("Saved");
+    }),
+    deleteDish: el => busy(el, async () => {
+      if (!window.confirm("Delete this dish? Diary entries already logged keep their calories.")) return;
+      const id = ctx.id;
+      await run(() => sb.from("ct_dishes").delete().eq("id", id));
+      S.dishes = S.dishes.filter(d => d.id !== id);
+      closeSheet(); render();
+    }),
+
+    // weight
+    saveWeight: el => busy(el, async () => {
+      const unit = S.settings.weight_unit || "kg";
+      const kg = readWeight(unit, "w");
+      if (!(kg > 0)) { toast("Enter a weight.", true); return; }
+      const saved = await run(() => sb.from("ct_weights").upsert({ user_id: S.user.id, day: isoDay(), kg }, { onConflict: "user_id,day" }).select().single());
+      S.weights = S.weights.filter(w => w.day !== saved.day).concat(saved);
+      render(); toast("Weight saved");
+    }),
+    editWeight: el => openWeightEntry(el.dataset.id),
+    updateWeight: el => busy(el, async () => {
+      const unit = S.settings.weight_unit || "kg";
+      const kg = readWeight(unit, "e");
+      if (!(kg > 0)) { toast("Enter a weight.", true); return; }
+      const saved = await run(() => sb.from("ct_weights").update({ kg }).eq("id", ctx.id).select().single());
+      S.weights = S.weights.map(w => (w.id === saved.id ? saved : w));
+      closeSheet(); render();
+    }),
+    deleteWeight: el => busy(el, async () => {
+      const id = ctx.id;
+      await run(() => sb.from("ct_weights").delete().eq("id", id));
+      S.weights = S.weights.filter(w => w.id !== id);
+      closeSheet(); render();
+    }),
+
+    // settings
+    setUnit: el => {
+      const kg = readWeight(ctx.unit, "g");     // keep a typed goal when switching units
+      ctx.unit = el.dataset.k;
+      $sheet.querySelectorAll("[data-act=setUnit]").forEach(b => b.classList.toggle("on", b.dataset.k === ctx.unit));
+      document.getElementById("goalBox").innerHTML = weightInputs(ctx.unit, kg > 0 ? kg : null, "g");
+    },
+    saveSettings: el => busy(el, async () => {
+      const t = k => { const v = num(document.getElementById("t_" + k).value); return v > 0 ? v : null; };
+      const goal = readWeight(ctx.unit, "g");
+      const row = { user_id: S.user.id, kcal_target: t("kcal"), protein_target: t("protein"), carbs_target: t("carbs"), fat_target: t("fat"),
+        goal_kg: goal > 0 ? goal : null, weight_unit: ctx.unit, updated_at: new Date().toISOString() };
+      const saved = await run(() => sb.from("ct_settings").upsert(row, { onConflict: "user_id" }).select().single());
+      S.settings = saved || row;
+      closeSheet(); render(); toast("Saved");
+    }),
+  };
+
+  // Typing updates only the numbers that depend on it, so the keyboard stays put.
+  const LIVE = {
+    foodSearch: el => { S.foodQuery = el.value; document.getElementById("foodList").innerHTML = foodListHtml(); },
+    pickSearch: el => { ctx.q = el.value; document.getElementById("pickList").innerHTML = pickListHtml(); },
+    amt: el => { ctx.amount = el.value; document.getElementById("pv").innerHTML = nutPreview(amountNut(), "This adds"); },
+    entryAmt: el => { ctx.amount = el.value; document.getElementById("pv").innerHTML = nutPreview(entryNut(), "Now"); },
+    fName: el => { ctx.name = el.value; },
+    fBasis: el => { ctx.basis = el.value; refreshFoodPreview(); },
+    fVal: el => { ctx.vals[el.dataset.k] = el.value; refreshFoodPreview(); },
+    dName: el => { ctx.name = el.value; },
+    dPortions: el => { ctx.portions = el.value; document.getElementById("dpv").innerHTML = dishTotalsHtml(); },
+    dCooked: el => { ctx.cooked = el.value; document.getElementById("dpv").innerHTML = dishTotalsHtml(); },
+    ingAmt: el => {
+      const i = +el.dataset.i;
+      ctx.items[i].amount = el.value;
+      const f = foodsById()[ctx.items[i].food_id];
+      const k = document.getElementById("ingK" + i);
+      if (f && k) k.textContent = fmtK(foodFor(f, num(el.value) || 0).kcal);
+      document.getElementById("dpv").innerHTML = dishTotalsHtml();
+    },
+    ingSearch: el => { ctx.q = el.value; document.getElementById("ingPickList").innerHTML = ingPickHtml(); },
+  };
+  function refreshFoodPreview() {
+    const box = document.getElementById("fpv");
+    if (!box) return;
+    const pv = foodStoredPreview();
+    box.innerHTML = pv;
+    box.classList.toggle("hidden", !pv);
+  }
+
+  document.addEventListener("click", ev => {
+    const el = ev.target.closest("[data-act]");
+    if (!el) return;
+    const fn = A[el.dataset.act];
+    if (fn) fn(el, ev);
+  });
+  document.addEventListener("input", ev => {
+    const el = ev.target.closest("[data-live]");
+    if (el && LIVE[el.dataset.live]) LIVE[el.dataset.live](el, ev);
+  });
+  document.addEventListener("keydown", ev => {
+    if (ev.key === "Enter" && ev.target && ev.target.id === "pw") A.signIn(document.querySelector("[data-act=signIn]"));
+  });
+
+  // ── Start ─────────────────────────────────────────────────────────────────
+  async function setUser(u) {
+    S.user = u;
+    closeSheet();
+    if (!u) { S.loading = false; render(); return; }
+    S.loading = true; render();
+    try { await loadAll(); }
+    catch (e) { console.error(e); toast(isNet(e) ? "No connection — pull down or reopen to try again." : "Couldn't load your data.", true); }
+    S.loading = false; render();
+  }
+
+  // After midnight, "today" moves on by itself when the app comes back.
+  let lastToday = isoDay();
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    const t = isoDay();
+    if (t !== lastToday) { if (S.day === lastToday) S.day = t; lastToday = t; if (S.user && !ctx) render(); }
+  });
+
+  function registerSW() {
+    if (!("serviceWorker" in navigator)) return;
+    window.addEventListener("load", () => {
+      const hadController = !!navigator.serviceWorker.controller;
+      navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" }).then(r => r.update()).catch(() => {});
+      let reloading = false;
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        if (reloading || !hadController) return;
+        reloading = true; window.location.reload();
+      });
+    });
+  }
+
+  async function boot() {
+    registerSW();
+    if (!window.supabase || !window.supabase.createClient) {
+      $app.innerHTML = `<div class="empty">Couldn't start. Check your connection and reopen the app.</div>`;
+      return;
+    }
+    sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+    const { data } = await sb.auth.getSession();
+    await setUser(data && data.session ? data.session.user : null);
+    // Only react to a different account: Supabase re-announces the same login on
+    // every return to the app. Deferred, as Supabase asks, so no calls run inside it.
+    sb.auth.onAuthStateChange((event, session) => {
+      const u = session ? session.user : null;
+      if ((u && u.id) !== (S.user && S.user.id)) setTimeout(() => setUser(u), 0);
+    });
+  }
+  boot();
+})();
