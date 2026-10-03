@@ -6,7 +6,7 @@
 (function () {
   "use strict";
 
-  const APP_VERSION = "2.0.1";
+  const APP_VERSION = "2.1.0";
   const SUPABASE_URL = "https://yfbarahnwcrwewtpithb.supabase.co";
   const SUPABASE_KEY = "sb_publishable_ItUAbr04KIijWuO-JWgDNg_J5YCwaqK";
   const DIARY_DAYS = 120;   // diary history loaded up front; older days load when opened
@@ -1184,7 +1184,12 @@
   function showSheet(html) {
     $sheet.innerHTML = `<div class="veil" data-act="closeVeil"><div class="sheet">${html}</div></div>`;
   }
-  function closeSheet() { stopScan(); ctx = null; $sheet.innerHTML = ""; }
+  function closeSheet() {
+    stopScan();
+    if (ctx && ctx.kind === "news") pref.set("seenVersion", APP_VERSION);   // seen, however it was closed
+    ctx = null;
+    $sheet.innerHTML = "";
+  }
   const closeX = `<button class="iconbtn x" data-act="closeSheet" aria-label="Close">✕</button>`;
   const segHtml = (opts, cur, act) => `<div class="seg">${opts.map(([k, l]) => `<button type="button" data-act="${act}" data-k="${k}" class="${cur === k ? "on" : ""}">${l}</button>`).join("")}</div>`;
   const nutPreview = (n, note) => `<div class="row"><div class="grow"><div class="label">${note}</div><div class="macros" style="margin-top:4px">${macroLine(n)}</div></div><div class="kcal" style="font-size:18px">${fmtK(n.kcal)} <span class="tiny dim">kcal</span></div></div>`;
@@ -1447,8 +1452,42 @@
         ${st.fit_status === "linked" && !(hasScope("sleep") && hasScope("heart")) ? `<div class="row" style="margin-top:8px"><span class="grow small" style="color:var(--amber)">Sleep and heart rate need one more permission.</span><button class="btn blue sm" data-act="fitConnect">Allow</button></div>` : ""}</div>
       ${st.fit_status === "linked" ? `<div class="field" id="remindBox">${remindHtml()}</div>` : ""}
       <div class="row" style="margin-top:16px"><span class="grow tiny faint">Vitals v${APP_VERSION}${S.user && S.user.email ? " · " + esc(S.user.email) : ""}</span>
+        <button class="btn ghost" data-act="whatsNew" style="padding:8px 12px;font-size:12px">What's new</button>
         <button class="btn ghost" data-act="signOut" style="padding:8px 12px;font-size:12px">Sign out</button></div>`);
     if (st.fit_status === "linked") checkPush();
+  }
+
+  // ── What's new ────────────────────────────────────────────────────────────
+  // After an update, a note of what's changed shows once on each phone (every version since it
+  // was last opened; not on a new install). Add an entry, newest first, with every update you'd notice.
+  const WHATS_NEW = [
+    { v: "2.1.0", date: "3 Oct 2026", items: [
+      "<b>What's new</b> — after each update, a note like this says what's changed. See it again any time in Settings (⚙).",
+    ] },
+  ];
+  const NEWS_FROM = "2.0.1";   // a phone that had the app before these notes started sees everything after this
+  function verCmp(a, b) {
+    const x = String(a).split(".").map(Number), y = String(b).split(".").map(Number);
+    for (let i = 0; i < Math.max(x.length, y.length); i++) { const d = (x[i] || 0) - (y[i] || 0); if (d) return d; }
+    return 0;
+  }
+  let newsChecked = false, bootSignedIn = false;
+  function whatsNewCheck() {
+    if (newsChecked) return;
+    newsChecked = true;
+    const seen = pref.get("seenVersion", "");
+    if (seen === APP_VERSION) return;
+    if (!seen && !bootSignedIn) { pref.set("seenVersion", APP_VERSION); return; }   // a new install: nothing has changed for them
+    const since = seen || NEWS_FROM;
+    const notes = WHATS_NEW.filter(n => verCmp(n.v, since) > 0 && verCmp(n.v, APP_VERSION) <= 0);
+    if (!notes.length) { pref.set("seenVersion", APP_VERSION); return; }
+    if (!ctx) showNews(notes);
+  }
+  function showNews(notes) {
+    ctx = { kind: "news" };
+    showSheet(`${closeX}<h3>What's new</h3>
+      ${notes.map(n => `<div class="news"><div class="label">Version ${esc(n.v)} · ${esc(n.date)}</div><ul>${n.items.map(i => `<li>${i}</li>`).join("")}</ul></div>`).join("")}
+      <button class="btn primary block" data-act="closeSheet">Got it</button>`);
   }
 
   // ── Step reminder: a notification from the server when you're under your step goal ──
@@ -1748,6 +1787,7 @@
       else { loadLive().then(renderPage); }
     },
     settings: () => openSettings(),
+    whatsNew: () => { closeSheet(); showNews(WHATS_NEW); },
     goToday: () => { S.day = isoDay(); render(); },
     day: el => busy(null, async () => { S.day = addDays(S.day, +el.dataset.n); render(); await ensureDay(S.day); render(); }),
     mode: el => busy(null, async () => {
@@ -2132,6 +2172,7 @@
     syncBurn();
     healPush();
     if (S.view === "home") enterHealth();
+    whatsNewCheck();
   }
 
   // Foods and dishes are shared, so fetch them again when coming back to the app
@@ -2184,6 +2225,7 @@
     }
     sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
     const { data } = await sb.auth.getSession();
+    bootSignedIn = !!(data && data.session);   // signed in already = not a new install (see whatsNewCheck)
     await setUser(data && data.session ? data.session.user : null);
     // Only react to a different account: Supabase re-announces the same login on
     // every return to the app. Deferred, as Supabase asks, so no calls run inside it.

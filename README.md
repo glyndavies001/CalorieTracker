@@ -47,6 +47,10 @@ Handy details:
   use and keeps in `ct_config`). Phones' subscriptions are in `ct_push_subs`. On iPhone this works only when
   the app is on the Home Screen (iOS 16.4+).
 
+- **What's new** – after an update, a note of what's changed shows once on each phone (every
+  version since it was last opened; not on a new install), and again from Settings. Add an entry to
+  `WHATS_NEW` in `app.js`, newest first, with every update you'd notice.
+
 ## How it's built
 
 Plain HTML and JavaScript with no build step: `index.html`, `app.js`, `sw.js` (network-first
