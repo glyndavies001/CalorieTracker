@@ -202,6 +202,31 @@
     details.tbl[open] summary { margin-bottom: 6px; }
     details.tbl .tr { padding: 7px 0; border-top: 1px solid var(--line); gap: 12px; }
     details.tbl .tv { min-width: 64px; text-align: right; font-variant-numeric: tabular-nums; }
+
+    /* cycle: pink for period days, teal for the estimated fertile window and ovulation */
+    .daynav button:disabled { opacity: .35; cursor: default; }
+    .cyc-per { color: var(--accent2); } .cyc-late { color: var(--amber); } .cyc-fert { color: #7fe3d6; } .cyc-none { color: var(--muted); }
+    .cal { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+    .cal .cw { text-align: center; font-size: 10px; font-weight: 700; color: var(--dim); padding: 2px 0 4px; }
+    .cd { position: relative; aspect-ratio: 1; min-width: 0; padding: 0; border-radius: 50%; border: 1.5px solid transparent; background: none;
+      color: var(--soft); font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: center; }
+    .cd:disabled { cursor: default; }
+    .cd:disabled:not(.pred):not(.fert):not(.ovu) { color: var(--faint); }
+    .cd.per { background: var(--accent2); color: #2a0716; font-weight: 800; }
+    .cd.pred { border: 1.5px dashed var(--accent2); color: #ffb3d1; }
+    .cd.fert { background: #10333a; color: #7fe3d6; }
+    .cd.ovu { border: 2px solid #4ad0c0; color: #7fe3d6; font-weight: 800; }
+    .cd.today { outline: 2px solid #fff; outline-offset: 1px; }
+    .cd .dot { position: absolute; bottom: 4px; left: 50%; width: 5px; height: 5px; margin-left: -2.5px; border-radius: 50%; background: var(--accent2); }
+    .cd .dot.n { background: var(--muted); }
+    .cd.per .dot.n { background: #2a0716; }
+    .ckey { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 10.5px; color: var(--muted); margin-top: 12px; }
+    .ckey i { display: inline-block; width: 11px; height: 11px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; box-sizing: border-box; }
+    .ckey i.per { background: var(--accent2); } .ckey i.pred { border: 1.5px dashed var(--accent2); }
+    .ckey i.fert { background: #10333a; border: 1px solid #2a6a66; } .ckey i.ovu { border: 2px solid #4ad0c0; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip { background: var(--card2); border: 1px solid var(--line2); border-radius: 999px; color: var(--muted); font-size: 12.5px; font-weight: 700; padding: 7px 12px; }
+    .chip.on { background: var(--accent-bg); border-color: var(--accent); color: var(--accent); }
   </style>
 </head>
 <body>

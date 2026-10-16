@@ -6,7 +6,7 @@
 (function () {
   "use strict";
 
-  const APP_VERSION = "2.1.0";
+  const APP_VERSION = "2.2.0";
   const SUPABASE_URL = "https://yfbarahnwcrwewtpithb.supabase.co";
   const SUPABASE_KEY = "sb_publishable_ItUAbr04KIijWuO-JWgDNg_J5YCwaqK";
   const DIARY_DAYS = 120;   // diary history loaded up front; older days load when opened
@@ -120,6 +120,65 @@
       goalDays: walked.filter(x => x.steps >= (stepGoal || 10000)).length };
   }
 
+  // ── Cycle: periods from the logged days, and estimates from your own history ──
+  // A period is a run of light / medium / heavy days (spotting doesn't count), allowing up to two
+  // unlogged days inside it. Averages use the last six cycles (15–60 days) and finished periods
+  // (up to 12 days); until there are any, a 28-day cycle and a 5-day period. Ovulation is estimated
+  // 14 days before the next period, and the fertile window as the five days before it plus the day.
+  const PERIOD_FLOWS = ["light", "medium", "heavy"];
+  const dayDiff = (a, b) => Math.round((parseIso(b) - parseIso(a)) / 86400000);
+  function cycleInfo(rows, today) {
+    const days = (rows || []).filter(r => PERIOD_FLOWS.includes(r.flow)).map(r => r.day).sort();
+    const periods = [];
+    for (const d of days) {
+      const p = periods[periods.length - 1];
+      if (p && dayDiff(p.end, d) <= 3) p.end = d; else periods.push({ start: d, end: d });
+    }
+    periods.forEach((p, i) => { p.len = dayDiff(p.start, p.end) + 1; p.cycle = i + 1 < periods.length ? dayDiff(p.start, periods[i + 1].start) : null; });
+    const last = periods[periods.length - 1] || null;
+    const avg = a => Math.round(a.reduce((s, n) => s + n, 0) / a.length);
+    const cycles = periods.filter(p => p.cycle >= 15 && p.cycle <= 60).slice(-6).map(p => p.cycle);
+    // the latest period may still be going, so it only counts once it's had a few days without a log
+    const lens = periods.filter(p => p.len <= 12 && (p !== last || dayDiff(p.end, today) >= 3)).slice(-6).map(p => p.len);
+    const c = { today, periods, last, cycleLen: cycles.length ? avg(cycles) : 28, periodLen: lens.length ? avg(lens) : 5, cycles: cycles.length };
+    if (!last) return c;
+    c.day = dayDiff(last.start, today) + 1;
+    c.inPeriod = today <= last.end || (dayDiff(last.end, today) === 1 && c.day <= c.periodLen);
+    c.next = addDays(last.start, c.cycleLen);
+    c.late = !c.inPeriod && c.next <= today ? dayDiff(c.next, today) : null;   // 0 = due today
+    c.ov = addDays(c.next, -14);                                            // this cycle's ovulation (estimate)
+    c.fertFrom = addDays(c.ov, -5);
+    // the periods ahead (counted from today while one is late) and their cycles' ovulation,
+    // far enough for the calendar's furthest month
+    const first = c.late != null ? today : c.next, horizon = addDays(today, 125);
+    c.ahead = [];
+    for (let k = 0, start = first; k < 12 && start <= horizon; k++, start = addDays(first, k * c.cycleLen))
+      c.ahead.push({ start, end: addDays(start, c.periodLen - 1), ov: k ? addDays(start, -14) : c.ov });
+    return c;
+  }
+  // The line under "Day 12" on Home and the Cycle page.
+  function cycleStatus(c) {
+    if (!c.last) return { big: "–", sub: "Log your period to start", tone: "" };
+    const big = `Day ${c.day}`;
+    if (c.inPeriod) return { big, sub: `Period · day ${c.day}`, tone: "per" };
+    if (c.late != null) return { big, sub: c.late === 0 ? "Period due today" : `Period ${c.late} day${c.late === 1 ? "" : "s"} late`, tone: "late" };
+    if (c.today === c.ov) return { big, sub: "Ovulation today (estimate)", tone: "fert" };
+    if (c.today >= c.fertFrom && c.today < c.ov) return { big, sub: "Fertile window (estimate)", tone: "fert" };
+    const n = dayDiff(c.today, c.next);
+    return { big, sub: `Next period in ~${n} day${n === 1 ? "" : "s"}`, tone: "" };
+  }
+  // Calendar marks: predicted period days, estimated fertile days and ovulation days.
+  function cycleMarks(c) {
+    const pred = new Set(), fert = new Set(), ovu = new Set();
+    if (!c.last) return { pred, fert, ovu };
+    const span = (a, b, set) => { for (let d = a; d <= b; d = addDays(d, 1)) set.add(d); };
+    for (const a of c.ahead) {
+      span(a.start, a.end, pred);
+      if (a.ov > c.last.end) { ovu.add(a.ov); span(addDays(a.ov, -5), addDays(a.ov, -1), fert); }
+    }
+    return { pred, fert, ovu };
+  }
+
   // ── Formatting ─────────────────────────────────────────────────────────────
   const fmtK = n => Math.round(+n || 0).toLocaleString("en-GB");
   const fmtG = n => { const v = +n || 0; return (v >= 10 ? Math.round(v) : Math.round(v * 10) / 10) + "g"; };
@@ -166,7 +225,7 @@
 
   // Exposed for tests.
   window.CT = { zero, addN, scaleN, sumN, basisOf, foodFor, toStored, dishTotals, dishFor, kgToStLb, stLbToKg, fmtWeight, fmtDelta, isoDay, addDays, dayLabel, esc, normCode, validCode, offToFood,
-    daysIn, addMonths, monthStats, APP_VERSION };
+    daysIn, addMonths, monthStats, cycleInfo, cycleStatus, cycleMarks, APP_VERSION };
 
   // Small per-device preferences, such as list order. Storage can be unavailable, so nothing depends on it.
   const pref = {
@@ -177,6 +236,7 @@
   // ── State ─────────────────────────────────────────────────────────────────
   const S = { user: null, loading: true, view: "home", lib: pref.get("lib", "foods") === "dishes" ? "dishes" : "foods", day: isoDay(), foods: [], dishes: [], diary: [], diaryFrom: null, weights: [], settings: {}, foodQuery: "",
     burn: new Map(), steps: new Map(), push: { checked: false },   // from the Fitbit: day -> kcal burned, day -> steps
+    cycle: [], cycMonth: isoDay().slice(0, 7),   // logged cycle days (yours only), and the month the Cycle page shows
     health: { page: null, live: null, sleep: null, heart: null, shown: null, cheer: null, nightSel: null, hrSel: null, restSel: null },
     sort: pref.get("sort", "az") === "used" ? "used" : "az",
     mode: "day", month: isoDay().slice(0, 7), mSel: null, mLoading: false };   // Food tab: one day, or a month at a time
@@ -237,6 +297,9 @@
     S.diary = diary || [];
     S.burn = new Map(); S.steps = new Map(); takeBurn(burn);
     S.diaryFrom = from;
+    // Cycle days: on their own, so a problem here never stops the rest of the app loading.
+    try { S.cycle = (await run(() => sb.from("ct_cycle").select("day,flow,symptoms,note").order("day"))) || []; }
+    catch (e) { console.error(e); S.cycle = []; }
   }
   // Rows from ct_burn (or the server's sync): either number can be missing for a day.
   function takeBurn(rows) {
@@ -665,6 +728,11 @@
       wsub = first && first !== lastW ? `${fmtDelta(lastW.kg - first.kg, unit)} in the last 30 days` : dayLabel(lastW.day);
     }
     html += tile(`data-act="tab" data-v="weight" aria-label="Weight"`, "⚖️", "Weight", `<div class="tval sm">${lastW ? esc(fmtWeight(lastW.kg, unit)) : "–"}</div><div class="small muted">${esc(wsub)}</div>`);
+    // cycle, for whoever has switched it on
+    if (S.settings.cycle_on) {
+      const st = cycleStatus(cycleInfo(S.cycle, today));
+      html += tile(`data-act="hopen" data-p="cycle" aria-label="Cycle"`, "🌸", "Cycle", `<div class="tval sm">${st.big}</div><div class="small cyc-${st.tone || "none"}">${esc(st.sub)}</div>`);
+    }
     return html;
   }
 
@@ -727,22 +795,25 @@
     if (!p) { $page.innerHTML = ""; $page.classList.add("hidden"); return; }
     const y = $page.scrollTop;
     $page.classList.remove("hidden");
-    const title = { steps: "Steps", sleep: "Sleep", heart: "Heart rate" }[p];
-    const body = S.settings.fit_status === "reauth" ? reauthCard() : !S.settings.fit_status ? `<div class="card"><p class="small muted" style="margin:0 0 12px">Connect your Fitbit to see this.</p><button class="btn blue block" data-act="fitConnect">Connect Fitbit</button></div>`
+    const title = { steps: "Steps", sleep: "Sleep", heart: "Heart rate", cycle: "Cycle" }[p];
+    const body = p === "cycle" ? pageCycle()
+      : S.settings.fit_status === "reauth" ? reauthCard() : !S.settings.fit_status ? `<div class="card"><p class="small muted" style="margin:0 0 12px">Connect your Fitbit to see this.</p><button class="btn blue block" data-act="fitConnect">Connect Fitbit</button></div>`
       : p === "steps" ? pageSteps() : p === "sleep" ? pageSleep() : pageHeart();
     $page.innerHTML = `<div class="pg"><div class="pg-top"><button class="pg-back" data-act="pageBack" aria-label="Back">‹</button><h2>${title}</h2></div>${body}</div>`;
     $page.scrollTop = y;
     if (p === "steps") tickLive();
   }
   function openPage(p) {
-    if (!["steps", "sleep", "heart"].includes(p)) return;
+    if (!["steps", "sleep", "heart", "cycle"].includes(p)) return;
     Object.assign(S.health, { page: p, shown: null, cheer: null, nightSel: null, hrSel: null, restSel: null });
     if (p === "steps" && !S.health.live && S.steps.has(isoDay())) S.health.live = { steps: S.steps.get(isoDay()), minutes: [], syncedAt: S.settings.fit_synced_at || null, at: 0 };
+    if (p === "cycle") S.cycMonth = isoDay().slice(0, 7);
     try { history.pushState({ ctPage: p }, ""); } catch (e) { /* not essential */ }
     renderPage();
     $page.scrollTop = 0;
     healthTimers();
     keepAwake(p === "steps");
+    if (p === "cycle") return;   // all here already: nothing to fetch
     // Counting from old numbers, the first fresh ones could look like the goal being reached
     // right now: start from the fresh ones instead.
     const stale = p === "steps" && (!S.health.live || Date.now() - (S.health.live.at || 0) > 60000);
@@ -771,17 +842,77 @@
     } catch (e) { wake = null; }
   }
 
+  // ── Cycle page: where you are now, the month's calendar, averages and recent cycles ──
+  const FLOWS = [["", "None"], ["spotting", "Spotting"], ["light", "Light"], ["medium", "Medium"], ["heavy", "Heavy"]];
+  const SYMPTOMS = [["cramps", "Cramps"], ["headache", "Headache"], ["bloating", "Bloating"], ["mood", "Mood"], ["tired", "Tired"]];
+  const cycMaxMonth = () => addMonths(isoDay().slice(0, 7), 3);   // predictions only go a few months ahead
+  function pageCycle() {
+    const today = isoDay(), c = cycleInfo(S.cycle, today), st = cycleStatus(c), mk = cycleMarks(c);
+    const when = !c.last ? "" : c.inPeriod ? `Started ${shortDate(c.last.start)}` : c.late != null ? `Expected ${shortDate(c.next)}` : `Next period around ${shortDate(c.next)}`;
+    let html = `<div class="card"><div class="hero-sm">${st.big}</div>
+      <div class="cyc-${st.tone || "none"}" style="font-size:15px;font-weight:700">${esc(st.sub)}</div>
+      ${when ? `<div class="small muted" style="margin-top:3px">${esc(when)}</div>` : `<p class="small muted" style="margin:6px 0 0">Tap the first day of your last period on the calendar, or log today, and the predictions start from there.</p>`}
+      <button class="btn primary block" data-act="cycLog" style="margin-top:12px">Log today</button></div>`;
+    // the month
+    const ym = S.cycMonth, lead = (parseIso(ym + "-01").getDay() + 6) % 7, byDay = new Map(S.cycle.map(r => [r.day, r]));
+    let cells = "";
+    for (let i = 0; i < lead; i++) cells += `<span></span>`;
+    for (let d = 1; d <= daysIn(ym); d++) {
+      const iso = `${ym}-${String(d).padStart(2, "0")}`, r = byDay.get(iso);
+      const per = !!(r && PERIOD_FLOWS.includes(r.flow)), spot = !!(r && r.flow === "spotting"), noted = !!(r && ((r.symptoms && r.symptoms.length) || r.note));
+      const pred = !per && iso >= today && mk.pred.has(iso), ovu = mk.ovu.has(iso), fert = !ovu && mk.fert.has(iso);
+      const cls = [per && "per", pred && "pred", fert && "fert", ovu && "ovu", iso === today && "today"].filter(Boolean).join(" ");
+      const what = [per && `period (${r.flow})`, spot && "spotting", pred && "predicted period", ovu && "estimated ovulation", fert && "estimated fertile window", noted && "notes", iso === today && "today"].filter(Boolean).join(", ");
+      cells += `<button class="cd ${cls}" data-act="cycDay" data-day="${iso}"${iso > today ? " disabled" : ""} aria-label="${esc(shortDate(iso) + (what ? ": " + what : ""))}">${d}${spot ? `<i class="dot"></i>` : noted ? `<i class="dot n"></i>` : ""}</button>`;
+    }
+    html += `<div class="card"><div class="daynav"><button data-act="cycMonth" data-n="-1" aria-label="Previous month">‹</button>
+        <div class="when"><div class="big">${esc(monthLabel(ym))}</div></div>
+        <button data-act="cycMonth" data-n="1" aria-label="Next month"${ym >= cycMaxMonth() ? " disabled" : ""}>›</button></div>
+      <div class="cal">${["M", "T", "W", "T", "F", "S", "S"].map(w => `<span class="cw">${w}</span>`).join("")}${cells}</div>
+      <div class="ckey"><span><i class="per"></i>Period</span><span><i class="pred"></i>Predicted</span><span><i class="fert"></i>Fertile (est.)</span><span><i class="ovu"></i>Ovulation (est.)</span></div></div>`;
+    // averages and recent cycles
+    if (c.last) {
+      html += `<div class="card"><div class="grid3">
+        <div class="mstat"><div class="label">Cycle</div><div class="v">${c.cycleLen} days</div><div class="tiny faint">${c.cycles ? "average" : "until you've logged two"}</div></div>
+        <div class="mstat"><div class="label">Period</div><div class="v">${c.periodLen} days</div><div class="tiny faint">average</div></div>
+        <div class="mstat"><div class="label">Logged</div><div class="v">${c.periods.length}</div><div class="tiny faint">period${c.periods.length === 1 ? "" : "s"}</div></div>
+      </div></div>`;
+      html += `<div class="list"><div class="head"><span class="label">Recent cycles</span></div>${c.periods.slice(-6).reverse().map(p => `<div class="item">
+        <div class="grow"><div class="name">${esc(shortDate(p.start))}</div><div class="sub">Period ${p.len} day${p.len === 1 ? "" : "s"}</div></div>
+        <div class="small muted">${p.cycle ? `${p.cycle}-day cycle` : `day ${c.day} so far`}</div></div>`).join("")}</div>`;
+    }
+    html += `<p class="tiny faint" style="line-height:1.5">Predictions, the fertile window and ovulation are estimates from your own logs (a 28-day cycle until there's enough to go on), so don't rely on them for contraception. Only you can see this.</p>`;
+    return html;
+  }
+  function openCycleDay(day) {
+    if (!day || day > isoDay()) return;
+    const r = S.cycle.find(x => x.day === day) || null;
+    ctx = { kind: "cycleDay", day, flow: (r && r.flow) || "", symptoms: [...((r && r.symptoms) || [])], note: (r && r.note) || "", had: !!r };
+    showSheet(cycleDayHtml());
+  }
+  function cycleDayHtml() {
+    return `${closeX}<h3>${esc(longDate(ctx.day))}</h3>
+      <div class="field"><span class="label">Period</span>${segHtml(FLOWS, ctx.flow, "cycFlow")}</div>
+      <div class="field"><span class="label">How you feel</span><div class="chips">${SYMPTOMS.map(([k, l]) => `<button type="button" class="chip${ctx.symptoms.includes(k) ? " on" : ""}" data-act="cycSym" data-k="${k}" aria-pressed="${ctx.symptoms.includes(k)}">${l}</button>`).join("")}</div></div>
+      <div class="field"><span class="label">Note</span><input class="inp" id="cycNote" data-live="cycNote" maxlength="300" value="${esc(ctx.note)}" placeholder="Optional" autocomplete="off"></div>
+      ${ctx.had ? `<div class="grid2"><button class="btn danger" data-act="cycClear">Clear day</button><button class="btn primary" data-act="cycSave">Save</button></div>`
+        : `<button class="btn primary block" data-act="cycSave">Save</button>`}`;
+  }
+  // After a change: the page (and Home behind it) show it straight away.
+  function cycleSaved(msg) { closeSheet(); renderPage(); toast(msg); }
+
   // Refreshing: every 20 seconds while Home or a page is open, and the live
   // count ticks four times a second on Home and the Steps page.
   let hTimer = null, tTimer = null;
   function healthTimers() {
     clearInterval(hTimer); clearInterval(tTimer); hTimer = tTimer = null;
-    if (document.hidden || !S.user || S.settings.fit_status !== "linked" || !(S.view === "home" || S.health.page)) return;
+    if (document.hidden || !S.user || S.settings.fit_status !== "linked" || !(S.view === "home" || S.health.page) || S.health.page === "cycle") return;
     hTimer = setInterval(healthPoll, 20000);
     if (S.health.page === "steps" || !S.health.page) tTimer = setInterval(tickLive, 250);
   }
   async function healthPoll() {
     const p = S.health.page;
+    if (p === "cycle") return;   // nothing on it comes from the watch
     if (p === "heart") await loadHeart(false);
     else if (p === "sleep") await loadSleep(false);
     else await loadLive();
@@ -1451,6 +1582,9 @@
           : `<span class="grow small muted">See the calories you burn, your steps, sleep and heart rate, from your Fitbit.</span><button class="btn blue sm" data-act="fitConnect">Connect</button>`}</div>
         ${st.fit_status === "linked" && !(hasScope("sleep") && hasScope("heart")) ? `<div class="row" style="margin-top:8px"><span class="grow small" style="color:var(--amber)">Sleep and heart rate need one more permission.</span><button class="btn blue sm" data-act="fitConnect">Allow</button></div>` : ""}</div>
       ${st.fit_status === "linked" ? `<div class="field" id="remindBox">${remindHtml()}</div>` : ""}
+      <div class="field" style="margin-top:16px"><span class="label">Cycle tracking</span>
+        ${segHtml([["off", "Off"], ["on", "On"]], st.cycle_on ? "on" : "off", "cycleSet")}
+        <div class="tiny faint" style="margin-top:6px">Your period on Home, with predictions and an estimated fertile window. Only you can see it.</div></div>
       <div class="row" style="margin-top:16px"><span class="grow tiny faint">Vitals v${APP_VERSION}${S.user && S.user.email ? " · " + esc(S.user.email) : ""}</span>
         <button class="btn ghost" data-act="whatsNew" style="padding:8px 12px;font-size:12px">What's new</button>
         <button class="btn ghost" data-act="signOut" style="padding:8px 12px;font-size:12px">Sign out</button></div>`);
@@ -1461,6 +1595,9 @@
   // After an update, a note of what's changed shows once on each phone (every version since it
   // was last opened; not on a new install). Add an entry, newest first, with every update you'd notice.
   const WHATS_NEW = [
+    { v: "2.2.0", date: "16 Oct 2026", items: [
+      "<b>Cycle</b> — track your period: a calendar of logged and predicted periods, an estimated fertile window and ovulation day, symptoms and notes, and your averages. Switch it on in Settings (⚙) and it appears on Home. Only you can see it.",
+    ] },
     { v: "2.1.0", date: "3 Oct 2026", items: [
       "<b>What's new</b> — after each update, a note like this says what's changed. See it again any time in Settings (⚙).",
     ] },
@@ -1788,6 +1925,53 @@
     },
     settings: () => openSettings(),
     whatsNew: () => { closeSheet(); showNews(WHATS_NEW); },
+
+    // cycle
+    cycDay: el => openCycleDay(el.dataset.day),
+    cycLog: () => openCycleDay(isoDay()),
+    cycMonth: el => {
+      const next = addMonths(S.cycMonth, +el.dataset.n);
+      if (next > cycMaxMonth()) return;
+      S.cycMonth = next; renderPage();
+    },
+    cycFlow: el => {
+      ctx.flow = el.dataset.k;
+      $sheet.querySelectorAll("[data-act=cycFlow]").forEach(b => b.classList.toggle("on", b.dataset.k === ctx.flow));
+    },
+    cycSym: el => {
+      const k = el.dataset.k, i = ctx.symptoms.indexOf(k);
+      if (i >= 0) ctx.symptoms.splice(i, 1); else ctx.symptoms.push(k);
+      el.classList.toggle("on", i < 0); el.setAttribute("aria-pressed", String(i < 0));
+    },
+    cycSave: el => busy(el, async () => {
+      const day = ctx.day, had = ctx.had, note = ctx.note.trim().slice(0, 300);
+      const symptoms = SYMPTOMS.map(s => s[0]).filter(k => ctx.symptoms.includes(k));
+      if (!ctx.flow && !symptoms.length && !note) {   // nothing left on the day: it goes
+        if (had) await run(() => sb.from("ct_cycle").delete().eq("user_id", S.user.id).eq("day", day));
+        S.cycle = S.cycle.filter(r => r.day !== day);
+        cycleSaved(had ? "Cleared" : "Nothing to save");
+        return;
+      }
+      const row = { user_id: S.user.id, day, flow: ctx.flow || null, symptoms, note: note || null, updated_at: new Date().toISOString() };
+      await run(() => sb.from("ct_cycle").upsert(row, { onConflict: "user_id,day" }));
+      S.cycle = S.cycle.filter(r => r.day !== day).concat({ day, flow: row.flow, symptoms, note: row.note })
+        .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
+      cycleSaved("Saved");
+    }),
+    cycClear: el => busy(el, async () => {
+      const day = ctx.day;
+      await run(() => sb.from("ct_cycle").delete().eq("user_id", S.user.id).eq("day", day));
+      S.cycle = S.cycle.filter(r => r.day !== day);
+      cycleSaved("Cleared");
+    }),
+    cycleSet: el => busy(el, async () => {
+      const on = el.dataset.k === "on";
+      if (on === !!S.settings.cycle_on) return;
+      await saveRemind({ cycle_on: on });
+      $sheet.querySelectorAll("[data-act=cycleSet]").forEach(b => b.classList.toggle("on", (b.dataset.k === "on") === on));
+      render();
+      toast(on ? "Cycle is on Home now" : "Cycle tracking is off");
+    }),
     goToday: () => { S.day = isoDay(); render(); },
     day: el => busy(null, async () => { S.day = addDays(S.day, +el.dataset.n); render(); await ensureDay(S.day); render(); }),
     mode: el => busy(null, async () => {
@@ -2099,6 +2283,7 @@
       document.getElementById("dpv").innerHTML = dishTotalsHtml();
     },
     ingSearch: el => { ctx.q = el.value; document.getElementById("ingPickList").innerHTML = ingPickHtml(); },
+    cycNote: el => { ctx.note = el.value; },
     remindHour: el => {
       ctx.hour = +el.value;
       const note = document.getElementById("remindNote");

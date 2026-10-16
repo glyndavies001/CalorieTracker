@@ -46,6 +46,13 @@ Handy details:
   their goal, a notification (Web Push, encrypted, signed with a VAPID key pair the function makes on first
   use and keeps in `ct_config`). Phones' subscriptions are in `ct_push_subs`. On iPhone this works only when
   the app is on the Home Screen (iOS 16.4+).
+- **Cycle** – period tracking, off until switched on (Settings → Cycle tracking, `ct_settings.cycle_on`);
+  then a Home tile and a page with a calendar of logged and predicted periods, an estimated fertile window
+  and ovulation day, the averages and recent cycles. Each day can have a flow (spotting, light, medium,
+  heavy), symptoms and a note, kept in `ct_cycle`, private to whoever logs them. A period is a run of
+  light–heavy days (up to two unlogged days inside it; spotting doesn't count). Predictions use the
+  average of the last six cycles (28 days until there's one) and of finished periods (5 days); ovulation
+  is 14 days before the next period and the fertile window the five days before it.
 
 - **What's new** – after an update, a note of what's changed shows once on each phone (every
   version since it was last opened; not on a new install), and again from Settings. Add an entry to
@@ -58,10 +65,10 @@ service worker), `manifest.json`, the icons, `vendor/supabase.js` (Supabase JS 2
 `vendor/zxing.min.js` (@zxing/library 0.23.0, Apache-2.0, only loaded when scanning).
 
 Data lives in the same Supabase project as Vaulted, in the `ct_foods`, `ct_dishes`, `ct_diary`,
-`ct_weights` and `ct_settings` tables; sign in with an existing Vaulted login. Foods and dishes
+`ct_weights`, `ct_cycle` and `ct_settings` tables; sign in with an existing Vaulted login. Foods and dishes
 are one list shared by the household (either account can add, edit or delete); the diary,
-weights and settings are private to each account (row-level security). A barcode can belong
-to only one food.
+weights, cycle days and settings are private to each account (row-level security). A barcode can belong
+to only one food. Schema changes are in `supabase/migrations`.
 
 Diary entries store the calories and macros as they were when logged, so editing a food later
 doesn't change past days.
